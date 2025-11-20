@@ -52,6 +52,7 @@ def get_sheet():
 @app.get("/read-sheet")
 def read_sheet():
     sheet = get_sheet()
+    print(sheet)
     data = sheet.get_all_records()
     return {"data": data}
 
