@@ -2031,10 +2031,8 @@ async def bulk_set_default_passwords(request: Request, db: Session = Depends(get
 
     for s in students:
         if override_all or not s.password:
-            phone = (s.primary_phone_number or "").replace(" ", "").replace("-", "")
-            pwd = f"vama@{phone[-4:]}" if len(phone) >= 4 else default_pass
-            s.password = pwd
-            updated_students.append({"id": s.id, "name": f"{s.first_name} {s.last_name}", "email": s.email, "password": pwd})
+            s.password = default_pass
+            updated_students.append({"id": s.id, "name": f"{s.first_name} {s.last_name}", "email": s.email, "password": default_pass})
 
     for t in staff:
         if override_all or not t.password:
