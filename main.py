@@ -1649,6 +1649,234 @@ async def update_subscription(sub_id: int, request: Request, db: Session = Depen
 
 # ==================== PAYMENT — Dashboard ====================
 
+@app.get("/admin/reports")
+def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Comprehensive business intelligence — sales, students, teachers, attendance, operations."""
+    from datetime import datetime as _dt, timedelta as _td
+    from collections import defaultdict
+
+    now = _dt.utcnow()
+    days_map = {"week": 7, "month": 30, "quarter": 90, "year": 365}
+    span = days_map.get(period, 30)
+    start_dt = now - _td(days=span)
+    start_str = start_dt.strftime("%Y-%m-%d")
+
+    def in_period(date_str):
+        if not date_str:
+            return False
+        return str(date_str)[:10] >= start_str
+
+    today_str = now.strftime("%Y-%m-%d")
+
+    # ── Load data (center-scoped) ──────────────────────────────────────────────
+    students = db.query(Student)
+    if center_id:
+        students = students.filter(Student.center_id == center_id)
+    students = students.all()
+    student_ids = {s.id for s in students}
+    students_map = {s.id: s for s in students}
+
+    staff = db.query(Staff)
+    if center_id:
+        staff = staff.filter(Staff.center_id == center_id)
+    staff = staff.all()
+
+    batches = db.query(Batch)
+    if center_id:
+        batches = batches.filter(Batch.center_id == center_id)
+    batches = batches.all()
+    batch_ids = {b.id for b in batches}
+    batch_map = {b.id: b for b in batches}
+
+    all_invoices = db.query(Invoice).all()
+    invoices = [i for i in all_invoices if (not center_id or i.student_id in student_ids)]
+
+    all_sessions = db.query(ClassSession).all()
+    sessions = [s for s in all_sessions if (not center_id or s.batch_id in batch_ids)]
+
+    all_attendance = db.query(Attendance).all()
+    session_ids = {s.id for s in sessions}
+    attendance = [a for a in all_attendance if (not center_id or a.session_id in session_ids)]
+
+    staff_map = {s.id: s for s in staff}
+
+    # ════════════════════ SALES / REVENUE ════════════════════
+    paid_invoices = [i for i in invoices if i.status == "paid"]
+    period_paid = [i for i in paid_invoices if in_period(i.paid_date or i.issue_date)]
+
+    total_revenue = sum(i.paid_amount or i.total_amount or 0 for i in period_paid)
+    total_billed = sum(i.total_amount or 0 for i in invoices if in_period(i.issue_date))
+    total_collected = sum(i.paid_amount or 0 for i in invoices)
+    total_outstanding = sum((i.total_amount or 0) - (i.paid_amount or 0)
+                            for i in invoices if i.status in ("pending", "partial", "overdue"))
+    collection_rate = round((total_collected / sum(i.total_amount or 0 for i in invoices) * 100), 1) if invoices else 0
+
+    # Revenue by month (last 6 months)
+    rev_by_month = defaultdict(float)
+    for i in paid_invoices:
+        d = i.paid_date or i.issue_date
+        if d:
+            rev_by_month[str(d)[:7]] += (i.paid_amount or i.total_amount or 0)
+    revenue_trend = [{"month": k, "revenue": round(v)} for k, v in sorted(rev_by_month.items())][-6:]
+
+    # By payment mode
+    mode_rev = defaultdict(float)
+    for i in period_paid:
+        mode_rev[i.payment_mode or "Other"] += (i.paid_amount or i.total_amount or 0)
+    revenue_by_mode = [{"mode": k, "amount": round(v)} for k, v in sorted(mode_rev.items(), key=lambda x: -x[1])]
+
+    # By package / type
+    pkg_rev = defaultdict(lambda: {"amount": 0.0, "count": 0})
+    for i in period_paid:
+        key = i.payment_type or "Other"
+        pkg_rev[key]["amount"] += (i.paid_amount or i.total_amount or 0)
+        pkg_rev[key]["count"] += 1
+    revenue_by_package = [{"name": k, "amount": round(v["amount"]), "count": v["count"]}
+                          for k, v in sorted(pkg_rev.items(), key=lambda x: -x[1]["amount"])][:8]
+
+    # Invoice status breakdown
+    status_counts = defaultdict(int)
+    for i in invoices:
+        status_counts[i.status or "pending"] += 1
+
+    # ════════════════════ STUDENTS ════════════════════
+    new_students = [s for s in students if in_period(s.created_at.strftime("%Y-%m-%d") if s.created_at else None)]
+
+    # Enrollment trend by month
+    enroll_by_month = defaultdict(int)
+    for s in students:
+        if s.created_at:
+            enroll_by_month[s.created_at.strftime("%Y-%m")] += 1
+    enrollment_trend = [{"month": k, "count": v} for k, v in sorted(enroll_by_month.items())][-6:]
+
+    # By grade
+    grade_counts = defaultdict(int)
+    for s in students:
+        grade_counts[s.current_grade or "Unassigned"] += 1
+    students_by_grade = [{"grade": k, "count": v} for k, v in sorted(grade_counts.items(), key=lambda x: -x[1])]
+
+    # By course / instrument
+    course_counts = defaultdict(int)
+    for s in students:
+        course_counts[s.desired_course or s.instrument or "Unassigned"] += 1
+    students_by_course = [{"course": k, "count": v} for k, v in sorted(course_counts.items(), key=lambda x: -x[1])][:10]
+
+    # By center (only when viewing all)
+    center_counts = defaultdict(int)
+    centers_lookup = {c.id: c.name for c in db.query(Center).all()}
+    for s in students:
+        center_counts[centers_lookup.get(s.center_id, "Unassigned")] += 1
+    students_by_center = [{"center": k, "count": v} for k, v in sorted(center_counts.items(), key=lambda x: -x[1])]
+
+    # Exam students
+    exam_students = sum(1 for s in students if s.is_exam_student)
+
+    # ════════════════════ TEACHERS ════════════════════
+    teachers = [s for s in staff if (s.takes_classes or (s.role or "").lower() in ("teacher", "instructor"))]
+    sessions_by_teacher = defaultdict(int)
+    period_sessions_by_teacher = defaultdict(int)
+    for sess in sessions:
+        tid = sess.teacher_id or (batch_map.get(sess.batch_id).teacher_id if sess.batch_id in batch_map else None)
+        if tid:
+            sessions_by_teacher[tid] += 1
+            if in_period(sess.date):
+                period_sessions_by_teacher[tid] += 1
+
+    # students per teacher (via batch enrollments)
+    enrollments = db.query(StudentEnrollment).all()
+    students_per_teacher = defaultdict(set)
+    for e in enrollments:
+        b = batch_map.get(e.batch_id)
+        if b and b.teacher_id and e.student_id in student_ids:
+            students_per_teacher[b.teacher_id].add(e.student_id)
+
+    teacher_report = []
+    for t in teachers:
+        teacher_report.append({
+            "id": t.id,
+            "name": t.name,
+            "total_sessions": sessions_by_teacher.get(t.id, 0),
+            "period_sessions": period_sessions_by_teacher.get(t.id, 0),
+            "students": len(students_per_teacher.get(t.id, set())),
+        })
+    teacher_report.sort(key=lambda x: -x["period_sessions"])
+
+    # ════════════════════ ATTENDANCE ════════════════════
+    period_attendance = [a for a in attendance if a.session_id in {s.id for s in sessions if in_period(s.date)}]
+    att_present = sum(1 for a in period_attendance if a.status == "present")
+    att_absent = sum(1 for a in period_attendance if a.status == "absent")
+    att_total = att_present + att_absent
+    attendance_rate = round((att_present / att_total * 100), 1) if att_total else 0
+
+    # Attendance trend by week
+    att_by_week = defaultdict(lambda: {"present": 0, "absent": 0})
+    sess_date = {s.id: s.date for s in sessions}
+    for a in attendance:
+        d = sess_date.get(a.session_id)
+        if d and in_period(d):
+            try:
+                wk = _dt.strptime(str(d)[:10], "%Y-%m-%d").strftime("%Y-W%U")
+                if a.status in ("present", "absent"):
+                    att_by_week[wk][a.status] += 1
+            except Exception:
+                pass
+    attendance_trend = [{"week": k, **v} for k, v in sorted(att_by_week.items())][-8:]
+
+    # ════════════════════ OPERATIONS ════════════════════
+    period_sessions = [s for s in sessions if in_period(s.date)]
+    sessions_completed = sum(1 for s in period_sessions if (s.status or "scheduled") != "cancelled" and str(s.date)[:10] <= today_str)
+    sessions_cancelled = sum(1 for s in period_sessions if s.status == "cancelled")
+    sessions_upcoming = sum(1 for s in period_sessions if str(s.date)[:10] > today_str)
+
+    return {
+        "period": period,
+        "center_id": center_id,
+        "generated_at": now.isoformat(),
+        "sales": {
+            "total_revenue": round(total_revenue),
+            "total_billed": round(total_billed),
+            "total_collected": round(total_collected),
+            "total_outstanding": round(total_outstanding),
+            "collection_rate": collection_rate,
+            "paid_invoice_count": len(period_paid),
+            "avg_invoice": round(total_revenue / len(period_paid)) if period_paid else 0,
+            "revenue_trend": revenue_trend,
+            "revenue_by_mode": revenue_by_mode,
+            "revenue_by_package": revenue_by_package,
+            "status_breakdown": [{"status": k, "count": v} for k, v in status_counts.items()],
+        },
+        "students": {
+            "total": len(students),
+            "new_this_period": len(new_students),
+            "exam_students": exam_students,
+            "enrollment_trend": enrollment_trend,
+            "by_grade": students_by_grade,
+            "by_course": students_by_course,
+            "by_center": students_by_center,
+        },
+        "teachers": {
+            "total": len(teachers),
+            "report": teacher_report,
+            "total_sessions_period": sum(period_sessions_by_teacher.values()),
+        },
+        "attendance": {
+            "rate": attendance_rate,
+            "present": att_present,
+            "absent": att_absent,
+            "total_marked": att_total,
+            "trend": attendance_trend,
+        },
+        "operations": {
+            "total_sessions": len(period_sessions),
+            "completed": sessions_completed,
+            "cancelled": sessions_cancelled,
+            "upcoming": sessions_upcoming,
+            "active_batches": len(batches),
+            "cancellation_rate": round((sessions_cancelled / len(period_sessions) * 100), 1) if period_sessions else 0,
+        },
+    }
+
+
 @app.get("/admin/payment-dashboard")
 def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
     from datetime import datetime as _dt, timedelta as _td
