@@ -19,7 +19,7 @@ app.add_middleware(
 # ==================== DB Setup ====================
 from database import engine, get_db, Base
 from models import (
-    Staff, Student, Grade, Subject, ExamSession,
+    Center, Staff, Student, Grade, Subject, ExamSession,
     Syllabus, SyllabusModule, SyllabusContent, StudentProgress,
     Batch, ClassSession, StudentEnrollment, Attendance, Material,
     Package, StudentPackage, Invoice, Subscription, AppSetting
@@ -70,6 +70,19 @@ def _run_migrations():
         "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes TEXT",
         "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS sessions_total INTEGER",
         "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS sessions_used INTEGER DEFAULT 0",
+        """CREATE TABLE IF NOT EXISTS centers (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR NOT NULL UNIQUE,
+            address VARCHAR,
+            phone VARCHAR,
+            email VARCHAR,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "ALTER TABLE staff ADD COLUMN IF NOT EXISTS access_role VARCHAR DEFAULT 'teacher'",
+        "ALTER TABLE staff ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        "ALTER TABLE batches ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
         """CREATE TABLE IF NOT EXISTS app_settings (
             key VARCHAR PRIMARY KEY,
             value TEXT,
@@ -107,6 +120,40 @@ def _seed_defaults():
                     {"name": name}
                 )
 
+        # Seed centers
+        if conn.execute(text("SELECT COUNT(*) FROM centers")).scalar() == 0:
+            centers = [
+                ("Vama - Gunjur",           "Gunjur, Bengaluru"),
+                ("Vama - Varthur",          "Varthur, Bengaluru"),
+                ("Vama - Kadubeesnahali",   "Kadubeesnahali, Bengaluru"),
+            ]
+            for name, address in centers:
+                conn.execute(
+                    text("INSERT INTO centers (name, address, is_active) VALUES (:name, :address, TRUE)"),
+                    {"name": name, "address": address}
+                )
+            conn.commit()
+
+        # Backfill any centers with NULL is_active (Python-side default doesn't apply to raw SQL)
+        conn.execute(text("UPDATE centers SET is_active = TRUE WHERE is_active IS NULL"))
+        conn.commit()
+
+        # Assign students to centers based on nearest_vama_center
+        conn.execute(text("""
+            UPDATE students s
+            SET center_id = c.id
+            FROM centers c
+            WHERE s.nearest_vama_center = c.name
+              AND s.center_id IS NULL
+        """))
+        conn.commit()
+
+        # Designate super_admin: first staff with 'Admin' role or email = techatvama@gmail.com
+        conn.execute(text("""
+            UPDATE staff SET access_role = 'super_admin'
+            WHERE (role ILIKE '%super%admin%' OR email = 'techatvama@gmail.com')
+              AND access_role != 'super_admin'
+        """))
         conn.commit()
 
     # Seed exam_sessions separately to handle schema variations
@@ -255,9 +302,12 @@ async def teacher_login(request: Request, db: Session = Depends(get_db)):
 # ==================== Students ====================
 
 @app.get("/students")
-def get_students(db: Session = Depends(get_db)):
-    """List all students from the database."""
-    students = db.query(Student).order_by(Student.first_name).all()
+def get_students(center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """List all students, optionally filtered by center."""
+    q = db.query(Student)
+    if center_id:
+        q = q.filter(Student.center_id == center_id)
+    students = q.order_by(Student.first_name).all()
     return [
         {
             "id": s.id,
@@ -743,9 +793,10 @@ def calendar_filtered(
     start: Optional[str] = None,
     end: Optional[str] = None,
     enrollment_filter: Optional[int] = None,
+    center_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    """Return all sessions in a date range, optionally filtered to a student's batches.
+    """Return all sessions in a date range, optionally filtered to a student's batches or center.
     Returns the full session shape expected by the Scheduler / TeacherCalendar:
     batch.subject, batch.teacher_id, batch.color_tag, enrolled_students, etc.
     """
@@ -763,6 +814,9 @@ def calendar_filtered(
         if not enrolled_batch_ids:
             return []
         q = q.filter(ClassSession.batch_id.in_(enrolled_batch_ids))
+    if center_id:
+        center_batch_ids = [b.id for b in db.query(Batch).filter(Batch.center_id == center_id).all()]
+        q = q.filter(ClassSession.batch_id.in_(center_batch_ids)) if center_batch_ids else q.filter(False)
 
     sessions = q.order_by(ClassSession.date, ClassSession.start_time).all()
 
@@ -956,8 +1010,11 @@ async def create_syllabus(request: Request, db: Session = Depends(get_db)):
 # ==================== Staff ====================
 
 @app.get("/staff")
-def get_staff(db: Session = Depends(get_db)):
-    staff_list = crud.get_all_staff(db)
+def get_staff(center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    q = db.query(Staff)
+    if center_id:
+        q = q.filter(Staff.center_id == center_id)
+    staff_list = q.order_by(Staff.name).all()
     return [
         {
             "id": s.id,
@@ -965,6 +1022,8 @@ def get_staff(db: Session = Depends(get_db)):
             "first_name": s.first_name,
             "last_name": s.last_name,
             "role": s.role,
+            "access_role": s.access_role or "teacher",
+            "center_id": s.center_id,
             "email": s.email,
             "phone": s.phone,
             "calendar": s.calendar,
@@ -1035,11 +1094,13 @@ async def update_staff(staff_id: int, request: Request, db: Session = Depends(ge
 # ==================== Batches & Class Sessions ====================
 
 @app.get("/batches")
-def get_batches(db: Session = Depends(get_db)):
-    batches = db.query(Batch).all()
+def get_batches(center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    q = db.query(Batch)
+    if center_id:
+        q = q.filter(Batch.center_id == center_id)
     return [
-        {"id": b.id, "name": b.name, "subject": b.subject, "teacher_id": b.teacher_id}
-        for b in batches
+        {"id": b.id, "name": b.name, "subject": b.subject, "teacher_id": b.teacher_id, "center_id": b.center_id}
+        for b in q.all()
     ]
 
 
@@ -1392,15 +1453,19 @@ async def update_package(pkg_id: int, request: Request, db: Session = Depends(ge
 # ==================== PAYMENT — Invoices ====================
 
 @app.get("/admin/invoices")
-def list_invoices(status: Optional[str] = None, db: Session = Depends(get_db)):
+def list_invoices(status: Optional[str] = None, center_id: Optional[int] = None, db: Session = Depends(get_db)):
     import json
     q = db.query(Invoice)
     if status and status != "all":
         q = q.filter(Invoice.status == status)
+    if center_id:
+        center_student_ids = [s.id for s in db.query(Student).filter(Student.center_id == center_id).all()]
+        q = q.filter(Invoice.student_id.in_(center_student_ids))
     invoices = q.order_by(Invoice.created_at.desc()).all()
+    students_map = {s.id: s for s in db.query(Student).all()}
     result = []
     for inv in invoices:
-        student = db.query(Student).filter(Student.id == inv.student_id).first()
+        student = students_map.get(inv.student_id)
         result.append({
             "id": inv.id,
             "invoice_number": inv.invoice_number,
@@ -1983,6 +2048,93 @@ def student_payments(student_id: int, db: Session = Depends(get_db)):
         "invoices": [{"id": i.id, "invoice_number": i.invoice_number, "amount": i.amount, "tax_amount": i.tax_amount, "discount_amount": i.discount_amount, "total_amount": i.total_amount, "status": i.status, "payment_type": i.payment_type, "issue_date": i.issue_date, "due_date": i.due_date, "paid_date": i.paid_date} for i in invoices],
         "attendance_timeline": [],
         "upcoming_renewals": [{"plan": sub.plan_name, "amount": sub.amount, "due_date": sub.renewal_date, "sessions": sub.sessions_total}] if sub else [],
+    }
+
+
+# ==================== Centers ====================
+
+@app.get("/centers")
+def list_centers(db: Session = Depends(get_db)):
+    return [
+        {"id": c.id, "name": c.name, "address": c.address, "phone": c.phone,
+         "email": c.email, "is_active": c.is_active}
+        for c in db.query(Center).filter(Center.is_active == True).order_by(Center.name).all()
+    ]
+
+
+@app.post("/centers")
+async def create_center(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    c = Center(name=body["name"], address=body.get("address"), phone=body.get("phone"), email=body.get("email"))
+    db.add(c); db.commit(); db.refresh(c)
+    return {"id": c.id, "name": c.name}
+
+
+@app.put("/centers/{center_id}")
+async def update_center(center_id: int, request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    c = db.query(Center).filter(Center.id == center_id).first()
+    if not c: raise HTTPException(status_code=404, detail="Center not found")
+    for f in ["name", "address", "phone", "email", "is_active"]:
+        if f in body: setattr(c, f, body[f])
+    db.commit()
+    return {"message": "Updated"}
+
+
+@app.put("/admin/staff/{staff_id}/access")
+async def update_staff_access(staff_id: int, request: Request, db: Session = Depends(get_db)):
+    """Update a staff member's access_role and center assignment."""
+    body = await request.json()
+    s = db.query(Staff).filter(Staff.id == staff_id).first()
+    if not s: raise HTTPException(status_code=404, detail="Staff not found")
+    if "access_role" in body: s.access_role = body["access_role"]
+    if "center_id" in body:   s.center_id   = body["center_id"] or None
+    db.commit()
+    return {"message": "Access updated", "access_role": s.access_role, "center_id": s.center_id}
+
+
+@app.put("/admin/students/{student_id}/center")
+async def assign_student_center(student_id: int, request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    s = db.query(Student).filter(Student.id == student_id).first()
+    if not s: raise HTTPException(status_code=404, detail="Student not found")
+    s.center_id = body.get("center_id")
+    db.commit()
+    return {"message": "Center assigned"}
+
+
+# ==================== Admin Login ====================
+
+@app.post("/admin/login")
+async def admin_login(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    email    = body.get("email", "").strip().lower()
+    password = body.get("password", "")
+
+    staff = db.query(Staff).filter(Staff.email.ilike(email)).first()
+    if not staff:
+        raise HTTPException(status_code=401, detail="No account found with this email")
+    if staff.password is not None and staff.password != password:
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
+    access_role = staff.access_role or "teacher"
+    if access_role not in ("super_admin", "center_admin"):
+        raise HTTPException(status_code=403, detail="This account does not have admin access")
+
+    center = None
+    if staff.center_id:
+        c = db.query(Center).filter(Center.id == staff.center_id).first()
+        if c: center = {"id": c.id, "name": c.name}
+
+    return {
+        "admin": {
+            "id":          staff.id,
+            "name":        staff.name,
+            "email":       staff.email,
+            "access_role": access_role,
+            "center_id":   staff.center_id,
+            "center":      center,
+        }
     }
 
 

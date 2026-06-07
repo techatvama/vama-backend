@@ -7,6 +7,20 @@ from sqlalchemy.sql import func
 from database import Base
 
 
+class Center(Base):
+    __tablename__ = "centers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True)
+    address = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    staff = relationship("Staff", back_populates="center")
+
+
 class Staff(Base):
     __tablename__ = "staff"
 
@@ -14,7 +28,9 @@ class Staff(Base):
     name = Column(String, nullable=False)
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
-    role = Column(String, nullable=False)
+    role = Column(String, nullable=False)           # job title: Teacher, Admin, etc.
+    access_role = Column(String, default="teacher") # system role: super_admin | center_admin | teacher
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     phone = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False, index=True)
     calendar = Column(Boolean, default=True)
@@ -22,6 +38,8 @@ class Staff(Base):
     password = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    center = relationship("Center", back_populates="staff")
 
     # Relationships
     batches = relationship("Batch", back_populates="teacher")
@@ -49,6 +67,7 @@ class Student(Base):
     exam_date = Column(String, nullable=True)
     instrument = Column(String, nullable=True)
     teacher_id = Column(Integer, ForeignKey("staff.id"), nullable=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -148,6 +167,7 @@ class Batch(Base):
     name = Column(String, nullable=False)
     subject = Column(String, nullable=True)
     teacher_id = Column(Integer, ForeignKey("staff.id"), nullable=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     teacher = relationship("Staff", back_populates="batches")
