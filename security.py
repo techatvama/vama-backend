@@ -17,7 +17,7 @@ from jose import jwt, JWTError
 # ──────────────────────────────────────────────────────────────────────────
 # Password hashing — Argon2id (OWASP-preferred, memory-hard)
 # ──────────────────────────────────────────────────────────────────────────
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated=["bcrypt"])
 
 
 def hash_password(password: str) -> str:
