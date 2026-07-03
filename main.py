@@ -7,7 +7,6 @@ from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 from typing import Optional
 import os as _osmod
-import gspread
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
