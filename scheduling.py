@@ -11,7 +11,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from models import (
-    ClassTemplate, RecurrenceRule, ClassOccurrence, Enrollment, Holiday, Attendance,
+    ClassTemplate, RecurrenceRule, ClassOccurrence, Holiday, Attendance,
 )
 
 # Weekday code <-> Python weekday() (Mon=0 .. Sun=6)

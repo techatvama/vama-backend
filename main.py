@@ -2,7 +2,6 @@ from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, 
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -32,16 +31,16 @@ from models import (
     Syllabus, SyllabusModule, SyllabusContent, StudentProgress,
     Batch, ClassSession, StudentEnrollment, Attendance, Material,
     Package, StudentPackage, Invoice, Subscription, AppSetting,
-    AuthToken, AuditLog, LoginAttempt,
+    AuditLog,
     Room, Holiday, ClassTemplate, RecurrenceRule, ClassOccurrence,
-    Enrollment, TeacherAssignment, StudentInstructor,
+    Enrollment, StudentInstructor,
     InvoiceItem, InvoiceInstallment, InvoicePayment, PaymentMode, InvoiceTemplate,
     StudentApplication, LearningEnrollment
 )
 import scheduling
 import crud
-from schemas import StaffCreate, StaffResponse
-from auth import router as auth_router, provision_account, email_exists, verify_credentials, audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email, roles_for, require_roles, get_current_subject
+from schemas import StaffCreate
+from auth import router as auth_router, provision_account, email_exists, verify_credentials, audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email, roles_for, require_roles
 import security
 import enrollment as _enrollment_module
 
@@ -305,7 +304,6 @@ def _migrate_scheduling_v2():
     valid, advances the occurrence id sequence past them, and relaxes the
     attendances FK so it can reference occurrences going forward.
     """
-    from sqlalchemy import inspect as _inspect
     db = SessionLocal()
     try:
         sentinel = db.query(AppSetting).filter(AppSetting.key == "scheduling_v2_migrated").first()
@@ -3020,7 +3018,7 @@ def student_cancel_session(
     Checks the cancellation window from the student's active package.
     Marks attendance as 'student_cancelled' — does NOT cancel the session itself.
     """
-    from datetime import datetime as _dt, date as _date
+    from datetime import datetime as _dt
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -4255,7 +4253,6 @@ def list_invoices(status: Optional[str] = None, center_id: Optional[int] = None,
                   db: Session = Depends(get_db),
                   current = Depends(require_roles("super_admin", "center_admin"))):
     """List invoices. Phase 6: Paginated if page param provided, else returns array."""
-    import json
     q = db.query(Invoice)
     if status and status != "all":
         q = q.filter(Invoice.status == status)
@@ -5841,7 +5838,7 @@ def student_packages(student_id: int, db: Session = Depends(get_db)):
 
 @app.post("/student/payments/create-order")
 async def create_razorpay_order(request: Request, db: Session = Depends(get_db)):
-    import razorpay, os, json as _json
+    import razorpay, os
     body = await request.json()
     package_id = body.get("package_id")
     student_id = body.get("student_id")
@@ -5892,7 +5889,7 @@ async def create_razorpay_order(request: Request, db: Session = Depends(get_db))
 
 @app.post("/student/payments/verify")
 async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db)):
-    import razorpay, os, hashlib, hmac, random, string
+    import os, hashlib, hmac, random, string
     body = await request.json()
 
     razorpay_order_id = body.get("razorpay_order_id")
@@ -6324,8 +6321,6 @@ async def bulk_resend_activations(request: Request, db: Session = Depends(get_db
 def super_admin_stats(db: Session = Depends(get_db),
                      current = Depends(require_roles("super_admin"))):
     """Cross-center KPIs for super admin dashboard. Only super_admin can access."""
-    from datetime import datetime, timedelta
-
     # Global stats
     total_centers = db.query(Center).filter(Center.is_active == True).count()
     total_students = db.query(Student).count()

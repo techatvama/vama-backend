@@ -3,7 +3,6 @@ Production configuration for Vama Backend.
 Load from environment variables or .env file.
 """
 import os
-from typing import Optional
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):

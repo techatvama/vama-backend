@@ -11,11 +11,10 @@ Router prefix: /admin/enrollments  (admin CRUD)
 """
 import json
 import logging
-from datetime import date as _date, datetime
+from datetime import date as _date
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, case
 from sqlalchemy.orm import Session
 
 from database import get_db
