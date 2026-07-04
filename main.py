@@ -199,13 +199,13 @@ def _run_migrations():
         "CREATE INDEX IF NOT EXISTS ix_enrollment_student_occ ON class_enrollments(student_id, occurrence_id)",
         "CREATE INDEX IF NOT EXISTS ix_enrollment_template_occ_status ON class_enrollments(template_id, occurrence_id, status)",
     ]
-    with engine.connect() as conn:
-        for sql in migrations:
-            try:
+    for sql in migrations:
+        try:
+            with engine.connect() as conn:
                 conn.execute(text(sql))
-            except Exception:
-                pass
-        conn.commit()
+                conn.commit()
+        except Exception:
+            pass
 
 
 def _seed_defaults():
