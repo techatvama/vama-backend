@@ -1394,13 +1394,13 @@ def resolve_package_state(db: Session, sp: "StudentPackage") -> Optional[dict]:
 
 
 def get_active_student_package(db: Session, student_id: int, persist: bool = True):
-    """Return the latest active StudentPackage for a student, or None.
+    """Return the active StudentPackage for a student, or None.
 
-    Lazily reconciles the stored status: if the package's window has expired
-    or its sessions are exhausted, flips the stored `status` so admin lists
-    and queries stay accurate without a background job. Only rows still
-    'active' are considered usable.
+    Lazily reconciles stored status. When the current package is expired OR
+    exhausted, auto-activates the next queued package (if any) so sessions
+    only decrement from the new package after the current one is fully used.
     """
+    from datetime import date as _date
     sp = (
         db.query(StudentPackage)
         .filter(StudentPackage.student_id == student_id, StudentPackage.status == "active")
@@ -1408,13 +1408,37 @@ def get_active_student_package(db: Session, student_id: int, persist: bool = Tru
         .first()
     )
     if not sp:
-        return None
+        # Try to promote a queued package
+        queued = (
+            db.query(StudentPackage)
+            .filter(StudentPackage.student_id == student_id, StudentPackage.status == "queued")
+            .order_by(StudentPackage.created_at.asc())
+            .first()
+        )
+        if queued and persist:
+            queued.status = "active"
+            queued.start_date = str(_date.today())
+            db.commit()
+            return queued
+        return queued if queued else None
+
     state = resolve_package_state(db, sp)
-    # Only EXPIRED is terminal — an "exhausted" regular quota still permits
-    # makeup sessions, so we don't retire the package for that.
-    if persist and state and state["is_expired"]:
-        sp.status = "expired"
-        db.commit()
+    if state and (state["is_expired"] or state["is_exhausted"]):
+        if persist:
+            sp.status = "expired" if state["is_expired"] else "exhausted"
+            # Promote queued package
+            queued = (
+                db.query(StudentPackage)
+                .filter(StudentPackage.student_id == student_id, StudentPackage.status == "queued")
+                .order_by(StudentPackage.created_at.asc())
+                .first()
+            )
+            if queued:
+                queued.status = "active"
+                queued.start_date = str(_date.today())
+                db.commit()
+                return queued
+            db.commit()
         return None
     return sp
 
@@ -4789,6 +4813,16 @@ def invoice_html(inv_id: int, db: Session = Depends(get_db)):
     return f"<!doctype html><html><head><meta charset='utf-8'><title>Invoice {inv.invoice_number}</title></head><body>{body}</body></html>"
 
 
+@app.get("/student/invoices/{inv_id}/html", response_class=HTMLResponse)
+def student_invoice_html(inv_id: int, db: Session = Depends(get_db)):
+    """Same printable invoice for the student portal — open in browser, Ctrl/Cmd-P to save PDF."""
+    inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    body = _invoice_html(_invoice_detail(db, inv), "invoice", _org_settings_for_center(db, inv.center_id))
+    return f"<!doctype html><html><head><meta charset='utf-8'><title>Invoice {inv.invoice_number}</title></head><body>{body}</body></html>"
+
+
 @app.patch("/admin/invoices/{inv_id}")
 async def update_invoice(inv_id: int, request: Request, db: Session = Depends(get_db),
                         current = Depends(require_roles("super_admin", "center_admin"))):
@@ -5961,8 +5995,9 @@ async def create_razorpay_order(request: Request, db: Session = Depends(get_db))
 
     amount_paise = int(round(pkg.price * (1 + pkg.tax_percentage / 100) * 100))
 
-    key_id = os.getenv("RAZORPAY_KEY_ID", "rzp_test_placeholder")
-    key_secret = os.getenv("RAZORPAY_KEY_SECRET", "placeholder_secret")
+    _rzp_settings = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.in_(["razorpay_key_id", "razorpay_key_secret"])).all()}
+    key_id = _rzp_settings.get("razorpay_key_id") or os.getenv("RAZORPAY_KEY_ID", "rzp_test_placeholder")
+    key_secret = _rzp_settings.get("razorpay_key_secret") or os.getenv("RAZORPAY_KEY_SECRET", "placeholder_secret")
 
     try:
         client = razorpay.Client(auth=(key_id, key_secret))
@@ -6011,7 +6046,8 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
     student_id = body.get("student_id")
     test_mode = body.get("test_mode", False)
 
-    key_secret = os.getenv("RAZORPAY_KEY_SECRET", "placeholder_secret")
+    _rzp_row = db.query(AppSetting).filter(AppSetting.key == "razorpay_key_secret").first()
+    key_secret = (_rzp_row.value if _rzp_row else None) or os.getenv("RAZORPAY_KEY_SECRET", "placeholder_secret")
 
     # Verify signature (skip in test mode)
     if not test_mode and razorpay_signature:
@@ -6060,17 +6096,42 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
     )
     db.add(invoice)
 
-    # Activate / create StudentPackage
+    # Activate / queue StudentPackage
     from datetime import date, timedelta
-    start = date.today()
-    end = start + timedelta(days=pkg.validity_days or 30)
+    today_d = date.today()
 
-    # Supersede ALL existing active packages — one active package per student.
-    for old in db.query(StudentPackage).filter(
+    # Check if there's an active package with sessions remaining — queue behind it.
+    active_sp = db.query(StudentPackage).filter(
         StudentPackage.student_id == student_id,
         StudentPackage.status == "active",
+    ).order_by(StudentPackage.created_at.desc()).first()
+
+    if active_sp:
+        state = resolve_package_state(db, active_sp)
+        if state and state["sessions_remaining"] > 0 and not state["is_expired"]:
+            # Queue: start after the current package ends
+            queue_start = active_sp.end_date or str(today_d)
+            queue_end = str((date.fromisoformat(queue_start) + timedelta(days=pkg.validity_days or 30)))
+            new_status = "queued"
+            start = queue_start
+            end = queue_end
+        else:
+            # Current package exhausted/expired — cancel it and activate new one
+            active_sp.status = "expired" if state and state["is_expired"] else "exhausted"
+            start = str(today_d)
+            end = str(today_d + timedelta(days=pkg.validity_days or 30))
+            new_status = "active"
+    else:
+        start = str(today_d)
+        end = str(today_d + timedelta(days=pkg.validity_days or 30))
+        new_status = "active"
+
+    # Cancel any existing queued packages (replaced by new purchase)
+    for old_q in db.query(StudentPackage).filter(
+        StudentPackage.student_id == student_id,
+        StudentPackage.status == "queued",
     ).all():
-        old.status = "cancelled"
+        old_q.status = "cancelled"
 
     new_sp = StudentPackage(
         student_id=student_id,
@@ -6079,7 +6140,7 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
         end_date=str(end),
         sessions_used=0,
         makeup_used=0,
-        status="active",
+        status=new_status,
     )
     db.add(new_sp)
     db.commit()
@@ -6091,6 +6152,7 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
         "sessions": pkg.total_sessions,
         "valid_until": str(end),
         "amount_paid": total,
+        "queued": new_status == "queued",
     }
 
 
@@ -6107,6 +6169,15 @@ def student_payments(student_id: int, db: Session = Depends(get_db)):
         .first()
     )
     pkg = db.query(Package).filter(Package.id == sp.package_id).first() if sp else None
+
+    # Queued package (next in line)
+    queued_sp = (
+        db.query(StudentPackage)
+        .filter(StudentPackage.student_id == student_id, StudentPackage.status == "queued")
+        .order_by(StudentPackage.created_at.asc())
+        .first()
+    )
+    queued_pkg = db.query(Package).filter(Package.id == queued_sp.package_id).first() if queued_sp else None
 
     active_package = None
     if pkg and sp:
@@ -6158,8 +6229,20 @@ def student_payments(student_id: int, db: Session = Depends(get_db)):
         InvoiceInstallment.status != "paid",
     ).order_by(InvoiceInstallment.due_date).all()
 
+    queued_package = None
+    if queued_sp and queued_pkg:
+        queued_package = {
+            "name": queued_pkg.name,
+            "sessions_total": queued_pkg.total_sessions,
+            "start_date": queued_sp.start_date,
+            "end_date": queued_sp.end_date,
+            "price": queued_pkg.price,
+            "validity_days": queued_pkg.validity_days,
+        }
+
     return {
         "active_package": active_package,
+        "queued_package": queued_package,
         "enrollment_packages": enrollment_packages,
         "invoices": [{"id": i.id, "invoice_number": i.invoice_number, "amount": i.amount, "tax_amount": i.tax_amount, "discount_amount": i.discount_amount, "total_amount": i.total_amount, "paid_amount": i.paid_amount, "balance": round((i.total_amount or 0) - (i.paid_amount or 0), 2), "status": i.status, "payment_type": i.payment_type, "issue_date": i.issue_date, "due_date": i.due_date, "paid_date": i.paid_date} for i in invoices],
         "payments": [{"id": p.id, "invoice_number": inv_num.get(p.invoice_id), "amount": p.amount, "method": p.method, "reference": p.reference, "paid_date": p.paid_date} for p in payments],
@@ -6568,7 +6651,7 @@ def get_credentials(db: Session = Depends(get_db),
 # ==================== App Settings ====================
 
 # Sensitive keys — values are masked in GET responses
-_MASKED_KEYS = {"smtp_pass", "admin_password"}
+_MASKED_KEYS = {"smtp_pass", "admin_password", "razorpay_key_secret"}
 
 # Default values seeded on first load
 _DEFAULTS = {
@@ -6594,6 +6677,9 @@ _DEFAULTS = {
     "attendance_feedback":  "required_for_present",
     "session_start_hour":   "8",
     "session_end_hour":     "21",
+    "razorpay_key_id":      "",
+    "razorpay_key_secret":  "",
+    "razorpay_enabled":     "false",
 }
 
 
