@@ -3126,15 +3126,15 @@ def student_cancel_session(
     reason: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Student cancels their own attendance for a session.
+    """Student cancels their own attendance for an occurrence.
     Checks the cancellation window from the student's active package.
-    Marks attendance as 'student_cancelled' — does NOT cancel the session itself.
+    Marks attendance as 'student_cancelled' — does NOT cancel the occurrence itself.
     """
     from datetime import datetime as _dt
-    sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
-    if not sess:
+    occ = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
+    if not occ:
         raise HTTPException(status_code=404, detail="Session not found")
-    if sess.status == "cancelled":
+    if occ.status == "cancelled":
         raise HTTPException(status_code=400, detail="This session has already been cancelled")
 
     # Check cancellation window
@@ -3144,9 +3144,9 @@ def student_cancel_session(
         pkg = db.query(Package).filter(Package.id == sp.package_id).first()
         if pkg and pkg.cancellation_window_hours is not None:
             cancel_hours = pkg.cancellation_window_hours
-    if cancel_hours > 0 and sess.date and sess.start_time:
+    if cancel_hours > 0 and occ.date and occ.start_time:
         try:
-            session_dt = _dt.strptime(f"{sess.date} {sess.start_time}", "%Y-%m-%d %H:%M")
+            session_dt = _dt.strptime(f"{occ.date} {occ.start_time}", "%Y-%m-%d %H:%M")
             hours_until = (session_dt - _dt.now()).total_seconds() / 3600
             if hours_until < cancel_hours:
                 raise HTTPException(
