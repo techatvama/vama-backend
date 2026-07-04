@@ -259,6 +259,10 @@ class StudentEnrollment(Base):
 
 class Attendance(Base):
     __tablename__ = "attendances"
+    __table_args__ = (
+        Index("ix_attendance_session", "session_id"),
+        Index("ix_attendance_student", "student_id"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(Integer, ForeignKey("class_sessions.id"), nullable=False)
@@ -586,8 +590,13 @@ class Enrollment(Base):
     Table is `class_enrollments` — the legacy `enrollments` table is a separate
     batch-based feature and must not be clobbered."""
     __tablename__ = "class_enrollments"
-    __table_args__ = (UniqueConstraint("template_id", "student_id", "occurrence_id",
-                                       name="uq_enrollment_template_student_occ"),)
+    __table_args__ = (
+        UniqueConstraint("template_id", "student_id", "occurrence_id",
+                         name="uq_enrollment_template_student_occ"),
+        Index("ix_enrollment_template_occ_status", "template_id", "occurrence_id", "status"),
+        Index("ix_enrollment_occurrence", "occurrence_id"),
+        Index("ix_enrollment_student_occ", "student_id", "occurrence_id"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     template_id = Column(Integer, ForeignKey("class_templates.id"), nullable=False)

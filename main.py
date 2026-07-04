@@ -192,6 +192,12 @@ def _run_migrations():
             updated_at TIMESTAMPTZ DEFAULT NOW(),
             CONSTRAINT uq_learning_enrollment_student_subject UNIQUE (student_id, subject)
         )""",
+        # ── Performance indexes for session loading (N+1 query fix) ──
+        "CREATE INDEX IF NOT EXISTS ix_attendance_session ON attendances(session_id)",
+        "CREATE INDEX IF NOT EXISTS ix_attendance_student ON attendances(student_id)",
+        "CREATE INDEX IF NOT EXISTS ix_enrollment_occurrence ON class_enrollments(occurrence_id)",
+        "CREATE INDEX IF NOT EXISTS ix_enrollment_student_occ ON class_enrollments(student_id, occurrence_id)",
+        "CREATE INDEX IF NOT EXISTS ix_enrollment_template_occ_status ON class_enrollments(template_id, occurrence_id, status)",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -1870,9 +1876,8 @@ def _session_to_dict(s: ClassSession, db: Session):
 
 
 def _occ_session_shape(db, occ, stu_map=None, student_id=None):
-    """Convert a v2 ClassOccurrence to the legacy session shape the portals
-    expect (batch{}, enrolled_students, attendances) so teacher/student portals
-    render the new scheduling model unchanged."""
+    """Single-occurrence shape — kept for the one-off session-detail endpoint.
+    For lists use _build_session_shapes_bulk."""
     t = occ.template
     teacher = db.query(Staff).filter(Staff.id == occ.teacher_id).first() if occ.teacher_id else None
     roster_ids = _occurrence_roster_ids(db, occ) if occ.template_id else set()
@@ -1900,44 +1905,151 @@ def _occ_session_shape(db, occ, stu_map=None, student_id=None):
     }
 
 
+def _build_session_shapes_bulk(db, occs, student_id=None):
+    """Build session shapes for many occurrences using bulk queries (no N+1)."""
+    from collections import defaultdict
+    if not occs:
+        return []
+
+    occ_ids     = [o.id for o in occs]
+    template_ids = list({o.template_id for o in occs if o.template_id})
+    teacher_ids  = list({o.teacher_id  for o in occs if o.teacher_id})
+
+    # ── 1. Templates ──────────────────────────────────────────────────────────
+    tpl_map = {t.id: t for t in db.query(ClassTemplate).filter(
+        ClassTemplate.id.in_(template_ids or [-1])).all()}
+
+    # ── 2. Teachers ───────────────────────────────────────────────────────────
+    teacher_map = {s.id: s for s in db.query(Staff).filter(
+        Staff.id.in_(teacher_ids or [-1])).all()}
+
+    # ── 3. Baseline enrollments for all templates (one query) ─────────────────
+    baseline_rows = db.query(Enrollment).filter(
+        Enrollment.template_id.in_(template_ids or [-1]),
+        Enrollment.occurrence_id.is_(None),
+        Enrollment.status == "active"
+    ).all()
+    baseline_by_tpl = defaultdict(set)
+    for e in baseline_rows:
+        baseline_by_tpl[e.template_id].add(e.student_id)
+
+    # ── 4. Per-occurrence enrollment overrides (one query) ────────────────────
+    override_rows = db.query(Enrollment).filter(
+        Enrollment.occurrence_id.in_(occ_ids)).all()
+    overrides_by_occ = defaultdict(list)
+    for e in override_rows:
+        overrides_by_occ[e.occurrence_id].append(e)
+
+    # ── 5. Effective roster per occurrence, collect all student IDs ───────────
+    roster_by_occ = {}
+    all_student_ids = set()
+    for occ in occs:
+        base = set(baseline_by_tpl.get(occ.template_id, set())) if occ.template_id else set()
+        inc, exc = set(), set()
+        for e in overrides_by_occ.get(occ.id, []):
+            (inc if e.kind == "include" else exc).add(e.student_id)
+        roster = (base - exc) | inc
+        roster_by_occ[occ.id] = roster
+        all_student_ids |= roster
+
+    # ── 6. Students (one query) ───────────────────────────────────────────────
+    stu_map = {s.id: s for s in db.query(Student).filter(
+        Student.id.in_(all_student_ids or [-1])).all()}
+
+    # ── 7. Attendances (one query) ────────────────────────────────────────────
+    att_rows = db.query(Attendance).filter(
+        Attendance.session_id.in_(occ_ids)).all()
+    att_by_occ = defaultdict(list)
+    for a in att_rows:
+        att_by_occ[a.session_id].append(a)
+
+    # ── 8. Assemble ───────────────────────────────────────────────────────────
+    results = []
+    for occ in occs:
+        t        = tpl_map.get(occ.template_id)
+        teacher  = teacher_map.get(occ.teacher_id)
+        roster   = roster_by_occ.get(occ.id, set())
+        students = [{"id": s.id, "first_name": s.first_name, "last_name": s.last_name}
+                    for sid in roster if (s := stu_map.get(sid))]
+        atts     = att_by_occ.get(occ.id, [])
+        subject  = t.course if t else ""
+        my_att   = None
+        if student_id:
+            rec = next((a for a in atts if a.student_id == student_id), None)
+            my_att = rec.status if rec else None
+        results.append({
+            "id": occ.id, "date": occ.date, "start_time": occ.start_time, "end_time": occ.end_time,
+            "notes": occ.notes, "status": occ.status, "is_published": occ.is_published,
+            "teacher_id": occ.teacher_id, "teacher_name": teacher.name if teacher else None,
+            "enrollment_count": len(students), "enrolled_students": students,
+            "batch": {"id": t.id if t else None, "name": t.name if t else None, "subject": subject,
+                      "teacher_id": occ.teacher_id,
+                      "teacher": {"name": teacher.name} if teacher else None,
+                      "color_tag": _template_color(occ.template_id, occ.start_time),
+                      "capacity": t.capacity if t else None},
+            "attendances": [{"id": a.id, "student_id": a.student_id, "status": a.status} for a in atts],
+            "my_attendance": my_att,
+        })
+    return results
+
+
 @app.get("/teacher/{teacher_id}/sessions")
 def get_teacher_sessions(teacher_id: int, start: Optional[str] = None,
                          end: Optional[str] = None, db: Session = Depends(get_db)):
+    from datetime import date as _dd, timedelta
+    # Default to current month if no range given (avoids loading entire history)
+    if not start and not end:
+        today = _dd.today()
+        start = today.replace(day=1).isoformat()
+        end   = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        end   = end.isoformat()
     q = db.query(ClassOccurrence).filter(ClassOccurrence.teacher_id == teacher_id)
     if start:
         q = q.filter(ClassOccurrence.date >= start)
     if end:
         q = q.filter(ClassOccurrence.date <= end)
     occs = q.order_by(ClassOccurrence.date, ClassOccurrence.start_time).all()
-    return [_occ_session_shape(db, o) for o in occs]
+    return _build_session_shapes_bulk(db, occs)
 
 
 @app.get("/student/{student_id}/sessions")
 def get_student_sessions(student_id: int, start: Optional[str] = None,
                          end: Optional[str] = None, db: Session = Depends(get_db)):
-    # Occurrences the student is on the roster for: baseline template enrollments
-    # (minus per-occurrence excludes) plus per-occurrence includes.
+    from datetime import date as _dd, timedelta
+    # Default to current month
+    if not start and not end:
+        today = _dd.today()
+        start = today.replace(day=1).isoformat()
+        end   = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        end   = end.isoformat()
+
+    # ── 1. Templates the student is enrolled on (baseline) ───────────────────
     base_tpls = [e.template_id for e in db.query(Enrollment).filter(
         Enrollment.student_id == student_id, Enrollment.occurrence_id.is_(None),
         Enrollment.status == "active").all()]
+
+    # ── 2. Per-occurrence overrides for this student ──────────────────────────
     overrides = db.query(Enrollment).filter(
         Enrollment.student_id == student_id, Enrollment.occurrence_id.isnot(None)).all()
     excl_ids = {e.occurrence_id for e in overrides if e.kind == "exclude"}
     incl_ids = {e.occurrence_id for e in overrides if e.kind == "include" and e.status == "active"}
 
-    def _range(q):
-        if start:
-            q = q.filter(ClassOccurrence.date >= start)
-        if end:
-            q = q.filter(ClassOccurrence.date <= end)
+    def _apply_range(q):
+        if start: q = q.filter(ClassOccurrence.date >= start)
+        if end:   q = q.filter(ClassOccurrence.date <= end)
         return q
 
-    base_occs = _range(db.query(ClassOccurrence).filter(
+    # ── 3. Base occurrences from enrolled templates ────────────────────────────
+    base_occs  = _apply_range(db.query(ClassOccurrence).filter(
         ClassOccurrence.template_id.in_(base_tpls or [-1]))).all()
-    final_ids = ({o.id for o in base_occs} - excl_ids) | incl_ids
-    occs = _range(db.query(ClassOccurrence).filter(ClassOccurrence.id.in_(final_ids or [-1]))) \
+    final_ids  = ({o.id for o in base_occs} - excl_ids) | incl_ids
+
+    # ── 4. Final occurrence list (includes override-includes from other templates)
+    occs = _apply_range(db.query(ClassOccurrence).filter(
+        ClassOccurrence.id.in_(final_ids or [-1]))) \
         .order_by(ClassOccurrence.date, ClassOccurrence.start_time).all()
-    return [_occ_session_shape(db, o, student_id=student_id) for o in occs]
+
+    return _build_session_shapes_bulk(db, occs, student_id=student_id)
 
 
 @app.get("/student/{student_id}/attendance")
