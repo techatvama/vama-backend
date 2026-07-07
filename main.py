@@ -485,8 +485,11 @@ async def student_login(request: Request, db: Session = Depends(get_db)):
     if not student:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not verify_credentials(db, student, password):
-        db.commit()  # persist any legacy-hash migration / no-op
+    import asyncio
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, verify_credentials, db, student, password)
+    if not ok:
+        db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if (student.account_status or "active") != "active":
         raise HTTPException(status_code=403, detail="Your account is not active. Please activate it via the link sent to your email.")
@@ -542,7 +545,10 @@ async def teacher_login(request: Request, db: Session = Depends(get_db)):
     if not teacher:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not verify_credentials(db, teacher, password):
+    import asyncio
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, verify_credentials, db, teacher, password)
+    if not ok:
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if (teacher.account_status or "active") != "active":
@@ -5984,7 +5990,7 @@ def student_packages(student_id: int, db: Session = Depends(get_db)):
 
 @app.post("/student/payments/create-order")
 async def create_razorpay_order(request: Request, db: Session = Depends(get_db)):
-    import razorpay, os
+    import razorpay
     body = await request.json()
     package_id = body.get("package_id")
     student_id = body.get("student_id")
@@ -5995,9 +6001,10 @@ async def create_razorpay_order(request: Request, db: Session = Depends(get_db))
 
     amount_paise = int(round(pkg.price * (1 + pkg.tax_percentage / 100) * 100))
 
-    _rzp_settings = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.in_(["razorpay_key_id", "razorpay_key_secret"])).all()}
-    key_id = _rzp_settings.get("razorpay_key_id") or os.getenv("RAZORPAY_KEY_ID", "rzp_test_placeholder")
-    key_secret = _rzp_settings.get("razorpay_key_secret") or os.getenv("RAZORPAY_KEY_SECRET", "placeholder_secret")
+    student = db.query(Student).filter(Student.id == student_id).first()
+    rzp = _razorpay_for_center(db, student.center_id if student else None)
+    key_id     = rzp["key_id"]     or "rzp_test_placeholder"
+    key_secret = rzp["key_secret"] or "placeholder_secret"
 
     try:
         client = razorpay.Client(auth=(key_id, key_secret))
@@ -6036,7 +6043,7 @@ async def create_razorpay_order(request: Request, db: Session = Depends(get_db))
 
 @app.post("/student/payments/verify")
 async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db)):
-    import os, hashlib, hmac, random, string
+    import hashlib, hmac, random, string
     body = await request.json()
 
     razorpay_order_id = body.get("razorpay_order_id")
@@ -6046,8 +6053,9 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
     student_id = body.get("student_id")
     test_mode = body.get("test_mode", False)
 
-    _rzp_row = db.query(AppSetting).filter(AppSetting.key == "razorpay_key_secret").first()
-    key_secret = (_rzp_row.value if _rzp_row else None) or os.getenv("RAZORPAY_KEY_SECRET", "placeholder_secret")
+    student = db.query(Student).filter(Student.id == student_id).first()
+    rzp = _razorpay_for_center(db, student.center_id if student else None)
+    key_secret = rzp["key_secret"] or "placeholder_secret"
 
     # Verify signature (skip in test mode)
     if not test_mode and razorpay_signature:
@@ -6410,6 +6418,7 @@ async def assign_student_center(student_id: int, request: Request, db: Session =
 
 @app.post("/admin/login")
 async def admin_login(request: Request, db: Session = Depends(get_db)):
+    import asyncio
     body = await request.json()
     email    = body.get("email", "").strip().lower()
     password = body.get("password", "")
@@ -6417,7 +6426,10 @@ async def admin_login(request: Request, db: Session = Depends(get_db)):
     staff = db.query(Staff).filter(Staff.email.ilike(email)).first()
     if not staff:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not verify_credentials(db, staff, password):
+    # Offload Argon2 (CPU-bound) to thread pool so the event loop stays free
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, verify_credentials, db, staff, password)
+    if not ok:
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if (staff.account_status or "active") != "active":
@@ -6686,13 +6698,83 @@ _DEFAULTS = {
 def _get_all_settings(db: Session) -> dict:
     rows = db.query(AppSetting).all()
     stored = {r.key: r.value for r in rows}
-    # Merge defaults for any missing key
     result = {**_DEFAULTS, **stored}
-    # Mask sensitive keys
     for k in _MASKED_KEYS:
         if k in result and result[k]:
             result[k] = "••••••••"
     return result
+
+
+def _razorpay_for_center(db: Session, center_id) -> dict:
+    """Return Razorpay keys for a center; falls back to global settings then env vars."""
+    import os as _os
+    result: dict = {}
+    if center_id:
+        prefix = f"center_{center_id}_razorpay."
+        rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all()}
+        result = {
+            "key_id":     rows.get(f"{prefix}key_id", ""),
+            "key_secret": rows.get(f"{prefix}key_secret", ""),
+            "enabled":    rows.get(f"{prefix}enabled", ""),
+        }
+    # Fall back to global settings
+    if not result.get("key_id"):
+        global_row = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.in_(["razorpay_key_id", "razorpay_key_secret", "razorpay_enabled"])).all()}
+        result["key_id"]     = global_row.get("razorpay_key_id", "")     or _os.getenv("RAZORPAY_KEY_ID", "")
+        result["key_secret"] = global_row.get("razorpay_key_secret", "") or _os.getenv("RAZORPAY_KEY_SECRET", "")
+        result["enabled"]    = global_row.get("razorpay_enabled", "false")
+    return result
+
+
+@app.get("/admin/razorpay-settings")
+def get_razorpay_settings(center_id: int = None, db: Session = Depends(get_db)):
+    """Get Razorpay settings for a specific center (or global if no center_id)."""
+    if center_id:
+        prefix = f"center_{center_id}_razorpay."
+        rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all()}
+        return {
+            "center_id":  center_id,
+            "key_id":     rows.get(f"{prefix}key_id", ""),
+            "key_secret": "••••••••" if rows.get(f"{prefix}key_secret") else "",
+            "enabled":    rows.get(f"{prefix}enabled", "false"),
+        }
+    # Global fallback
+    global_row = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.in_(["razorpay_key_id", "razorpay_key_secret", "razorpay_enabled"])).all()}
+    return {
+        "center_id":  None,
+        "key_id":     global_row.get("razorpay_key_id", ""),
+        "key_secret": "••••••••" if global_row.get("razorpay_key_secret") else "",
+        "enabled":    global_row.get("razorpay_enabled", "false"),
+    }
+
+
+@app.put("/admin/razorpay-settings")
+async def put_razorpay_settings(request: Request, db: Session = Depends(get_db)):
+    """Save Razorpay keys for a center or globally. Body: {center_id?, key_id, key_secret, enabled}."""
+    body = await request.json()
+    center_id = body.get("center_id")
+
+    def _upsert(key: str, value: str):
+        row = db.query(AppSetting).filter(AppSetting.key == key).first()
+        if row:
+            row.value = value
+        else:
+            db.add(AppSetting(key=key, value=value))
+
+    if center_id:
+        prefix = f"center_{center_id}_razorpay."
+        _upsert(f"{prefix}key_id", body.get("key_id", ""))
+        if body.get("key_secret") and body["key_secret"] != "••••••••":
+            _upsert(f"{prefix}key_secret", body["key_secret"])
+        _upsert(f"{prefix}enabled", str(body.get("enabled", "false")).lower())
+    else:
+        _upsert("razorpay_key_id", body.get("key_id", ""))
+        if body.get("key_secret") and body["key_secret"] != "••••••••":
+            _upsert("razorpay_key_secret", body["key_secret"])
+        _upsert("razorpay_enabled", str(body.get("enabled", "false")).lower())
+
+    db.commit()
+    return get_razorpay_settings(center_id=center_id, db=db)
 
 
 @app.get("/admin/settings")

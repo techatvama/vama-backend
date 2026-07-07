@@ -17,7 +17,15 @@ from jose import jwt, JWTError
 # ──────────────────────────────────────────────────────────────────────────
 # Password hashing — Argon2id (OWASP-preferred, memory-hard)
 # ──────────────────────────────────────────────────────────────────────────
-pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated=["bcrypt"])
+# OWASP 2023 Argon2id minimums: m=19456 (19 MB), t=2, p=1
+# Default passlib params (m=102400, t=2, p=8) are too slow on constrained cloud VMs.
+pwd_context = CryptContext(
+    schemes=["argon2", "bcrypt"],
+    deprecated=["bcrypt"],
+    argon2__time_cost=2,
+    argon2__memory_cost=19456,
+    argon2__parallelism=1,
+)
 
 
 def hash_password(password: str) -> str:
