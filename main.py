@@ -210,6 +210,9 @@ def _run_migrations():
             changed_at TIMESTAMPTZ DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS ix_grade_history_student ON student_grade_history(student_id)",
+        # ── Fix stale FK: student_progress.content_id referenced old "contents" table ──
+        "ALTER TABLE student_progress DROP CONSTRAINT IF EXISTS student_progress_content_id_fkey",
+        "ALTER TABLE student_progress ADD CONSTRAINT student_progress_content_id_fkey FOREIGN KEY (content_id) REFERENCES syllabus_contents(id)",
     ]
     for sql in migrations:
         try:
