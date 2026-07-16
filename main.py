@@ -28,7 +28,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 from database import engine, get_db, Base, SessionLocal
 from models import (
     Center, Staff, Student, Grade, Subject, ExamSession,
-    Syllabus, SyllabusModule, SyllabusContent, StudentProgress,
+    Syllabus, SyllabusModule, SyllabusContent, StudentProgress, StudentGradeHistory,
     Batch, ClassSession, StudentEnrollment, Attendance, Material,
     Package, StudentPackage, Invoice, Subscription, AppSetting,
     AuditLog,
@@ -198,6 +198,18 @@ def _run_migrations():
         "CREATE INDEX IF NOT EXISTS ix_enrollment_occurrence ON class_enrollments(occurrence_id)",
         "CREATE INDEX IF NOT EXISTS ix_enrollment_student_occ ON class_enrollments(student_id, occurrence_id)",
         "CREATE INDEX IF NOT EXISTS ix_enrollment_template_occ_status ON class_enrollments(template_id, occurrence_id, status)",
+        # ── Grade history ──
+        """CREATE TABLE IF NOT EXISTS student_grade_history (
+            id SERIAL PRIMARY KEY,
+            student_id INTEGER NOT NULL REFERENCES students(id),
+            from_grade VARCHAR,
+            to_grade VARCHAR NOT NULL,
+            change_type VARCHAR DEFAULT 'manual',
+            changed_by VARCHAR,
+            notes TEXT,
+            changed_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_grade_history_student ON student_grade_history(student_id)",
     ]
     for sql in migrations:
         try:
@@ -980,14 +992,27 @@ async def create_student(request: Request, db: Session = Depends(get_db),
 
 @app.put("/students/{student_id}")
 async def update_student(student_id: int, request: Request, db: Session = Depends(get_db),
-                        current = Depends(require_roles("super_admin", "center_admin"))):
+                        current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Update student — handles both portal fields and general fields."""
     body = await request.json()
 
     student = db.query(Student).filter(Student.id == student_id).first()
     if student:
-        # Portal / teacher-assigned fields
-        if "current_grade" in body:
+        # Portal / teacher-assigned fields — log grade changes to history
+        if "current_grade" in body and body["current_grade"] != student.current_grade:
+            old_grade = student.current_grade
+            new_grade = body["current_grade"]
+            student.current_grade = new_grade
+            changed_by = body.get("changed_by") or current.get("name") or current.get("email", "")
+            db.add(StudentGradeHistory(
+                student_id=student.id,
+                from_grade=old_grade,
+                to_grade=new_grade,
+                change_type="manual",
+                changed_by=changed_by,
+                notes=body.get("grade_change_notes"),
+            ))
+        elif "current_grade" in body:
             student.current_grade = body["current_grade"]
         if "syllabus_type" in body:
             student.syllabus_type = body["syllabus_type"]
@@ -1802,7 +1827,87 @@ async def update_student_progress(
 
     db.commit()
     db.refresh(prog)
-    return {"status": prog.status, "notes": prog.notes}
+
+    # Check if the whole syllabus is now complete (all items = done)
+    syllabus_complete = False
+    next_grade = None
+    syllabus = db.query(Syllabus).filter(
+        Syllabus.grade_name == student.current_grade,
+        Syllabus.syllabus_type == student.syllabus_type
+    ).first()
+    if syllabus:
+        all_content_ids = [c.id for m in syllabus.modules for c in m.contents]
+        if all_content_ids:
+            done_count = db.query(StudentProgress).filter(
+                StudentProgress.student_id == student_id,
+                StudentProgress.content_id.in_(all_content_ids),
+                StudentProgress.status == "done"
+            ).count()
+            syllabus_complete = (done_count == len(all_content_ids))
+            if syllabus_complete:
+                # Find the next grade by display_order
+                current_grade_obj = db.query(Grade).filter(Grade.name == student.current_grade).first()
+                if current_grade_obj:
+                    next_grade_obj = db.query(Grade).filter(
+                        Grade.display_order > current_grade_obj.display_order
+                    ).order_by(Grade.display_order).first()
+                    if next_grade_obj:
+                        next_grade = next_grade_obj.name
+
+    return {"status": prog.status, "notes": prog.notes, "syllabus_complete": syllabus_complete, "next_grade": next_grade}
+
+
+@app.get("/students/{student_id}/grade-history")
+def get_grade_history(student_id: int, db: Session = Depends(get_db)):
+    history = db.query(StudentGradeHistory).filter(
+        StudentGradeHistory.student_id == student_id
+    ).order_by(StudentGradeHistory.changed_at.desc()).all()
+    return [
+        {
+            "id": h.id,
+            "from_grade": h.from_grade,
+            "to_grade": h.to_grade,
+            "change_type": h.change_type,
+            "changed_by": h.changed_by,
+            "notes": h.notes,
+            "changed_at": h.changed_at.isoformat() if h.changed_at else None,
+        }
+        for h in history
+    ]
+
+
+@app.post("/teacher/students/{student_id}/promote")
+async def promote_student_grade(
+    student_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current: dict = Depends(require_roles("staff", "center_admin", "super_admin"))
+):
+    """Promote a student to the next grade and log it."""
+    body = await request.json()
+    to_grade = (body.get("to_grade") or "").strip()
+    changed_by = body.get("changed_by") or current.get("name") or current.get("email", "")
+    notes = body.get("notes", "")
+
+    if not to_grade:
+        raise HTTPException(status_code=400, detail="to_grade is required")
+
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    old_grade = student.current_grade
+    student.current_grade = to_grade
+    db.add(StudentGradeHistory(
+        student_id=student.id,
+        from_grade=old_grade,
+        to_grade=to_grade,
+        change_type="auto_promote",
+        changed_by=changed_by,
+        notes=notes or f"Promoted after completing {old_grade} syllabus",
+    ))
+    db.commit()
+    return {"success": True, "from_grade": old_grade, "to_grade": to_grade}
 
 
 @app.post("/teacher/students/{student_id}/modules/{module_id}/contents")

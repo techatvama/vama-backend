@@ -211,6 +211,21 @@ class StudentProgress(Base):
     content = relationship("SyllabusContent", back_populates="progress_records")
 
 
+class StudentGradeHistory(Base):
+    __tablename__ = "student_grade_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    from_grade = Column(String, nullable=True)   # None for the very first assignment
+    to_grade = Column(String, nullable=False)
+    change_type = Column(String, default="manual")  # "manual" | "auto_promote"
+    changed_by = Column(String, nullable=True)       # name of teacher / admin
+    notes = Column(Text, nullable=True)
+    changed_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    student = relationship("Student")
+
+
 class Batch(Base):
     __tablename__ = "batches"
 
