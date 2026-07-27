@@ -117,6 +117,7 @@ class StudentApplication(Base):
     allergies = Column(String, nullable=True)
     referrer = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
+    custom_responses = Column(Text, nullable=True)  # JSON dict for custom form fields
     status = Column(String, nullable=False, default="pending")  # pending | approved | rejected
     rejection_reason = Column(String, nullable=True)
     center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
@@ -224,6 +225,17 @@ class StudentGradeHistory(Base):
     changed_at = Column(DateTime(timezone=True), server_default=func.now())
 
     student = relationship("Student")
+
+
+class CenterFormConfig(Base):
+    __tablename__ = "center_form_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True, unique=True)
+    fields_json = Column(Text, nullable=False)  # JSON array of field config objects
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    center = relationship("Center")
 
 
 class Batch(Base):

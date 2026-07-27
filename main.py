@@ -35,7 +35,7 @@ from models import (
     Room, Holiday, ClassTemplate, RecurrenceRule, ClassOccurrence,
     Enrollment, StudentInstructor,
     InvoiceItem, InvoiceInstallment, InvoicePayment, PaymentMode, InvoiceTemplate,
-    StudentApplication, LearningEnrollment
+    StudentApplication, LearningEnrollment, CenterFormConfig
 )
 import scheduling
 import crud
@@ -210,9 +210,27 @@ def _run_migrations():
             changed_at TIMESTAMPTZ DEFAULT NOW()
         )""",
         "CREATE INDEX IF NOT EXISTS ix_grade_history_student ON student_grade_history(student_id)",
+        # ── Hot-path indexes (calendar, attendance, payments) ──
+        "CREATE INDEX IF NOT EXISTS ix_occ_date_template ON class_occurrences(date, template_id)",
+        "CREATE INDEX IF NOT EXISTS ix_occ_teacher_date ON class_occurrences(teacher_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_occ_template_status ON class_occurrences(template_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_template_center ON class_templates(center_id)",
+        "CREATE INDEX IF NOT EXISTS ix_enrollment_template_status ON class_enrollments(template_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_students_center ON students(center_id)",
+        "CREATE INDEX IF NOT EXISTS ix_invoices_student ON invoices(student_id)",
+        "CREATE INDEX IF NOT EXISTS ix_invoices_center ON invoices(center_id)",
+        "CREATE INDEX IF NOT EXISTS ix_attendance_occ_status ON attendances(session_id, status)",
         # ── Fix stale FK: student_progress.content_id referenced old "contents" table ──
         "ALTER TABLE student_progress DROP CONSTRAINT IF EXISTS student_progress_content_id_fkey",
         "ALTER TABLE student_progress ADD CONSTRAINT student_progress_content_id_fkey FOREIGN KEY (content_id) REFERENCES syllabus_contents(id)",
+        "ALTER TABLE student_applications ADD COLUMN IF NOT EXISTS custom_responses TEXT",
+        # Per-center custom form config
+        """CREATE TABLE IF NOT EXISTS center_form_configs (
+            id SERIAL PRIMARY KEY,
+            center_id INTEGER REFERENCES centers(id) UNIQUE,
+            fields_json TEXT NOT NULL,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )""",
     ]
     for sql in migrations:
         try:
@@ -668,10 +686,11 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
     staff_map = {s.id: s.name for s in db.query(Staff).all()}
     center_map = {c.id: c.name for c in db.query(Center).all()}
     # Build enrollment map for enriching tracks with grade/syllabus/fee
+    all_enrollments = db.query(LearningEnrollment).all()
     enroll_map = {}
-    for le in db.query(LearningEnrollment).all():
+    for le in all_enrollments:
         enroll_map[(le.student_id, le.subject)] = le
-    pkg_map_ov = {p.id: p.name for p in db.query(Package).all()}
+    pkg_map = {p.id: p.name for p in db.query(Package).all()}
 
     tracks_by_student = {}
     for ti in db.query(StudentInstructor).all():
@@ -686,12 +705,11 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
             "syllabus_type": le.syllabus_type if le else "Trinity",
             "status": le.status if le else "active",
             "fee_package_id": le.fee_package_id if le else None,
-            "fee_package_name": pkg_map_ov.get(le.fee_package_id) if le else None,
+            "fee_package_name": pkg_map.get(le.fee_package_id) if le else None,
         })
     # Build learning_enrollments map per student for the enrollment module
-    pkg_map = {p.id: p.name for p in db.query(Package).all()}
     enrollments_by_student = {}
-    for le in db.query(LearningEnrollment).all():
+    for le in all_enrollments:
         enrollments_by_student.setdefault(le.student_id, []).append({
             "id": le.id,
             "subject": le.subject,
@@ -1096,6 +1114,94 @@ async def update_student(student_id: int, request: Request, db: Session = Depend
     raise HTTPException(status_code=404, detail="Student not found")
 
 
+# ==================== Form Builder / Form Config ====================
+
+DEFAULT_FORM_FIELDS = [
+    {"key": "first_name", "label": "First Name", "type": "text", "required": True, "enabled": True, "system": True, "order": 0},
+    {"key": "last_name", "label": "Last Name", "type": "text", "required": True, "enabled": True, "system": True, "order": 1},
+    {"key": "email", "label": "Email", "type": "email", "required": True, "enabled": True, "system": True, "order": 2},
+    {"key": "primary_phone_number", "label": "Phone", "type": "tel", "required": True, "enabled": True, "system": True, "order": 3},
+    {"key": "date_of_birth", "label": "Date of Birth", "type": "date", "required": False, "enabled": True, "system": False, "order": 4},
+    {"key": "gender", "label": "Gender", "type": "select", "required": False, "enabled": True, "system": False, "order": 5, "options": ["Male", "Female", "Other"]},
+    {"key": "parent_name", "label": "Parent / Guardian Name", "type": "text", "required": False, "enabled": True, "system": False, "order": 6},
+    {"key": "guardian_email", "label": "Guardian Email", "type": "email", "required": False, "enabled": True, "system": False, "order": 7},
+    {"key": "emergency_contact", "label": "Emergency Contact", "type": "tel", "required": False, "enabled": True, "system": False, "order": 8},
+    {"key": "preferred_mode_of_contact", "label": "Preferred Contact Mode", "type": "select", "required": False, "enabled": True, "system": False, "order": 9, "options": ["Email", "Phone", "WhatsApp"]},
+    {"key": "address", "label": "Address", "type": "textarea", "required": False, "enabled": True, "system": False, "order": 10},
+    {"key": "city", "label": "City", "type": "text", "required": False, "enabled": True, "system": False, "order": 11},
+    {"key": "state", "label": "State / Region", "type": "text", "required": False, "enabled": True, "system": False, "order": 12},
+    {"key": "desired_course", "label": "Desired Course", "type": "select_subjects", "required": True, "enabled": True, "system": True, "order": 13},
+    {"key": "class_frequency", "label": "Class Frequency", "type": "select", "required": False, "enabled": True, "system": False, "order": 14, "options": ["Weekly", "Bi-Weekly", "Monthly"]},
+    {"key": "nearest_vama_center", "label": "Nearest Center", "type": "select_centers", "required": True, "enabled": True, "system": True, "order": 15},
+    {"key": "blood_group", "label": "Blood Group", "type": "select", "required": False, "enabled": True, "system": False, "order": 16, "options": ["A+","A-","B+","B-","AB+","AB-","O+","O-"]},
+    {"key": "allergies", "label": "Allergies", "type": "text", "required": False, "enabled": True, "system": False, "order": 17},
+    {"key": "referrer", "label": "How did you hear about us?", "type": "select", "required": False, "enabled": True, "system": False, "order": 18, "options": ["Social Media", "Google Search", "Advertisement", "Referral", "Event", "Returning Student", "Other"]},
+    {"key": "notes", "label": "Additional Notes", "type": "textarea", "required": False, "enabled": True, "system": False, "order": 19},
+]
+
+
+def _get_form_config_for_center(center_id: Optional[int], db: Session) -> list:
+    import json as _json
+    row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id == center_id).first()
+    if not row:
+        row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id.is_(None)).first()
+    if row:
+        try:
+            return _json.loads(row.fields_json)
+        except Exception:
+            pass
+    return DEFAULT_FORM_FIELDS
+
+
+@app.get("/public/form-config")
+def get_public_form_config(center: Optional[str] = None, center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Return form field config for a given center (public, no auth)."""
+    cid = center_id
+    if not cid and center:
+        c = db.query(Center).filter(
+            (func.lower(Center.name) == center.lower()) |
+            (Center.name.ilike(center.replace("-", " ")))
+        ).first()
+        if c:
+            cid = c.id
+    return _get_form_config_for_center(cid, db)
+
+
+@app.get("/admin/form-config")
+def get_admin_form_config(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                          current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    """Return form config for current admin's center (or global if super_admin)."""
+    caller = current.get("obj")
+    cid = center_id
+    if not cid and caller and getattr(caller, "center_id", None):
+        cid = caller.center_id
+    return _get_form_config_for_center(cid, db)
+
+
+@app.put("/admin/form-config")
+async def save_admin_form_config(request: Request, center_id: Optional[int] = None,
+                                 db: Session = Depends(get_db),
+                                 current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    """Save form field config for a center."""
+    import json as _json
+    body = await request.json()
+    fields = body if isinstance(body, list) else body.get("fields", DEFAULT_FORM_FIELDS)
+
+    caller = current.get("obj")
+    cid = center_id
+    if not cid and caller and getattr(caller, "center_id", None):
+        cid = caller.center_id
+
+    row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id == cid).first()
+    if row:
+        row.fields_json = _json.dumps(fields)
+    else:
+        row = CenterFormConfig(center_id=cid, fields_json=_json.dumps(fields))
+        db.add(row)
+    db.commit()
+    return {"saved": True, "center_id": cid, "field_count": len(fields)}
+
+
 # ==================== Student Applications (Public Intake) ====================
 
 # Profile fields collected on intake that aren't columns on Student — they're kept on
@@ -1141,12 +1247,22 @@ def _application_dict(a: "StudentApplication") -> dict:
         "blood_group": a.blood_group, "allergies": a.allergies, "referrer": a.referrer, "notes": a.notes,
         "status": a.status, "rejection_reason": a.rejection_reason, "student_id": a.student_id,
         "reviewed_by": a.reviewed_by, "reviewed_at": a.reviewed_at, "created_at": a.created_at,
+        "custom_responses": a.custom_responses or "{}",
     }
+
+
+STANDARD_APPLICATION_FIELDS = {
+    "first_name", "last_name", "email", "guardian_email", "primary_phone_number",
+    "emergency_contact", "date_of_birth", "gender", "parent_name", "address", "city",
+    "state", "state_code", "desired_course", "class_frequency", "nearest_vama_center",
+    "preferred_mode_of_contact", "blood_group", "allergies", "referrer", "notes",
+}
 
 
 @app.post("/public/student-applications")
 async def submit_student_application(request: Request, db: Session = Depends(get_db)):
     """Public enrollment form — directly creates a Student record with no approval step."""
+    import json as _json
     body = await request.json()
     first_name = (body.get("first_name") or "").strip()
     last_name = (body.get("last_name") or "").strip()
@@ -1154,6 +1270,9 @@ async def submit_student_application(request: Request, db: Session = Depends(get
     primary_phone_number = (body.get("primary_phone_number") or "").strip()
     if not first_name or not last_name or not email or not primary_phone_number:
         raise HTTPException(status_code=400, detail="First name, last name, email, and phone number are required")
+
+    # Collect any custom field responses (keys not in standard fields)
+    custom_responses = {k: v for k, v in body.items() if k not in STANDARD_APPLICATION_FIELDS and v}
 
     if email_exists(db, email):
         raise HTTPException(status_code=400, detail="An account with this email already exists")
@@ -1209,6 +1328,7 @@ async def submit_student_application(request: Request, db: Session = Depends(get
         referrer=body.get("referrer") or None,
         notes=body.get("notes") or None,
         center_id=center_id,
+        custom_responses=_json.dumps(custom_responses) if custom_responses else None,
         status="approved",
         student_id=student.id,
     )
@@ -4130,6 +4250,7 @@ def scheduling_calendar(
     start: Optional[str] = None, end: Optional[str] = None, view: str = "week",
     teacher_id: Optional[int] = None, center_id: Optional[int] = None,
     room_id: Optional[int] = None, student_id: Optional[int] = None,
+    include_roster: bool = False,
     db: Session = Depends(get_db),
     current = Depends(require_roles("super_admin", "center_admin", "teacher", "student")),
 ):
@@ -4170,9 +4291,10 @@ def scheduling_calendar(
     occ_ids = [o.id for o in occs]
     templates = {t.id: t for t in db.query(ClassTemplate).filter(ClassTemplate.id.in_(template_ids or [-1])).all()}
     teachers = {s.id: s for s in db.query(Staff).filter(Staff.id.in_(teacher_ids or [-1])).all()}
-    rooms = {r.id: r for r in db.query(Room).all()}
-    # Per-occurrence roster = (template baseline − excludes) ∪ includes.
-    # Prefetch baselines (per template) + overrides (per occurrence) — no N+1.
+    # Only fetch rooms that are actually referenced — avoid full-table scan
+    room_ids_needed = {o.room_id for o in occs if o.room_id}
+    rooms = {r.id: r for r in db.query(Room).filter(Room.id.in_(room_ids_needed or [-1])).all()} if room_ids_needed else {}
+    # Per-occurrence roster — only computed when include_roster=True (detail views)
     baseline_by_template = {}   # tid -> set(student_id)
     overrides_by_occ = {}       # occ_id -> {"inc": set, "exc": set}
     stu_ids = set()
@@ -4186,7 +4308,8 @@ def scheduling_calendar(
             else:
                 d = overrides_by_occ.setdefault(e.occurrence_id, {"inc": set(), "exc": set()})
                 d["inc" if e.kind == "include" else "exc"].add(e.student_id)
-    stu_map = {s.id: s for s in db.query(Student).filter(Student.id.in_(stu_ids or [-1])).all()}
+    stu_map = ({s.id: s for s in db.query(Student).filter(Student.id.in_(stu_ids or [-1])).all()}
+               if include_roster else {})
 
     # Per-template occurrence counts → "is this a recurring class?" (>1 occurrence).
     from sqlalchemy import func as _func
@@ -4200,8 +4323,10 @@ def scheduling_calendar(
         base = set(baseline_by_template.get(o.template_id, set()))
         ov = overrides_by_occ.get(o.id)
         ids = ((base - ov["exc"]) | ov["inc"]) if ov else base
-        return [{"id": s.id, "first_name": s.first_name, "last_name": s.last_name}
-                for sid in ids for s in [stu_map.get(sid)] if s]
+        if include_roster:
+            return [{"id": s.id, "first_name": s.first_name, "last_name": s.last_name}
+                    for sid in ids for s in [stu_map.get(sid)] if s]
+        return len(ids)  # just the count when roster not requested
 
     present_counts = {}
     if occ_ids:
@@ -4215,7 +4340,8 @@ def scheduling_calendar(
         t = templates.get(o.template_id)
         teacher = teachers.get(o.teacher_id)
         room = rooms.get(o.room_id)
-        students = _roster_for(o)
+        roster = _roster_for(o)
+        enrolled_count = roster if isinstance(roster, int) else len(roster)
         result.append({
             "id": o.id, "template_id": o.template_id,
             "name": t.name if t else None, "course": t.course if t else None,
@@ -4227,9 +4353,9 @@ def scheduling_calendar(
             "is_published": o.is_published,
             "is_recurring": occ_count_by_tmpl.get(o.template_id, 0) > 1,
             "capacity": t.capacity if t else None,
-            "enrolled_count": len(students),
-            "enrollment_count": len(students),
-            "enrolled_students": students,
+            "enrolled_count": enrolled_count,
+            "enrollment_count": enrolled_count,
+            **({"enrolled_students": roster} if include_roster else {}),
             "present_count": present_counts.get(o.id, 0),
             # Compatibility shape so the existing calendar cards/pills render unchanged.
             "batch": {
@@ -4707,13 +4833,14 @@ def _maybe_email_invoice(db, inv, kind, to_email=None, do_send=True):
     to = to_email or detail["student_email"]
     if not to:
         return False
-    org = _org_settings_for_center(db, getattr(inv, "center_id", None))
+    center_id = getattr(inv, "center_id", None)
+    org = _org_settings_for_center(db, center_id)
     academy = org.get("academy_name") or "Vama Academy"
     subj = {"invoice": f"Invoice {inv.invoice_number} — {academy}",
             "reminder": f"Payment Reminder: {inv.invoice_number} — ₹{int(detail.get('balance', 0)):,} due — {academy}",
             "receipt": f"Payment Receipt {inv.invoice_number} — {academy}"}[kind]
     html = _reminder_html(detail, org) if kind == "reminder" else _invoice_html(detail, kind, org)
-    return send_email(to, subj, html)
+    return _send_center_email(db, center_id, to, subj, html)
 
 
 def _recompute_invoice_status(inv):
@@ -6945,6 +7072,174 @@ async def test_email(request: Request, db: Session = Depends(get_db)):
         return {"success": True, "message": f"Test email sent to {to_email}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SMTP error: {str(e)}")
+
+
+# ==================== Per-center SMTP Settings ====================
+
+def _smtp_prefix(center_id) -> str:
+    return f"center_{center_id}_smtp." if center_id else ""
+
+
+def _get_smtp_for_center(db: Session, center_id) -> dict:
+    """Return SMTP settings for a center; falls back to global settings then env defaults."""
+    import os as _os
+    if center_id:
+        prefix = _smtp_prefix(center_id)
+        rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all()}
+        if rows.get(f"{prefix}user"):
+            return {
+                "host":        rows.get(f"{prefix}host", "smtp.gmail.com"),
+                "port":        rows.get(f"{prefix}port", "587"),
+                "user":        rows.get(f"{prefix}user", ""),
+                "pass":        "••••••••" if rows.get(f"{prefix}pass") else "",
+                "sender_name": rows.get(f"{prefix}sender_name", ""),
+                "encryption":  rows.get(f"{prefix}encryption", "tls"),
+            }
+    # Fall back to global
+    rows = {r.key: r.value for r in db.query(AppSetting).filter(
+        AppSetting.key.in_(["smtp_host","smtp_port","smtp_user","smtp_pass","smtp_sender_name"])
+    ).all()}
+    return {
+        "host":        rows.get("smtp_host",        _os.getenv("SMTP_HOST", "smtp.gmail.com")),
+        "port":        rows.get("smtp_port",        _os.getenv("SMTP_PORT", "587")),
+        "user":        rows.get("smtp_user",        _os.getenv("SMTP_USER", "")),
+        "pass":        "••••••••" if (rows.get("smtp_pass") or _os.getenv("SMTP_PASS")) else "",
+        "sender_name": rows.get("smtp_sender_name", ""),
+        "encryption":  "tls",
+    }
+
+
+def _send_center_email(db, center_id, to: str, subject: str, body: str) -> bool:
+    """Send an email using the center's own SMTP if configured, otherwise
+    fall back to the global SMTP (DB settings, then env vars).
+    Returns True on success, False otherwise. Never raises."""
+    import smtplib as _smtp, os as _os, logging as _log
+    from email.mime.text import MIMEText as _MIMEText
+
+    host = port = user = pwd = sender = enc = None
+
+    if center_id:
+        prefix = _smtp_prefix(center_id)
+        rows = {r.key: r.value
+                for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all()}
+        if rows.get(f"{prefix}user") and rows.get(f"{prefix}pass"):
+            host   = rows.get(f"{prefix}host") or "smtp.gmail.com"
+            port   = int(rows.get(f"{prefix}port") or 587)
+            user   = rows.get(f"{prefix}user")
+            pwd    = rows.get(f"{prefix}pass")
+            sender = rows.get(f"{prefix}sender_name") or user
+            enc    = rows.get(f"{prefix}encryption") or "tls"
+
+    if not user:
+        # No center SMTP — try global DB settings, then env vars
+        rows = {r.key: r.value for r in db.query(AppSetting).filter(
+            AppSetting.key.in_(["smtp_host", "smtp_port", "smtp_user", "smtp_pass", "smtp_sender_name", "academy_name"])
+        ).all()}
+        host   = rows.get("smtp_host") or _os.getenv("SMTP_HOST", "")
+        port   = int(rows.get("smtp_port") or _os.getenv("SMTP_PORT", "587"))
+        user   = rows.get("smtp_user") or _os.getenv("SMTP_USER", "")
+        pwd    = rows.get("smtp_pass") or _os.getenv("SMTP_PASS", "")
+        sender = rows.get("smtp_sender_name") or rows.get("academy_name") or "Vama Academy"
+        enc    = "tls"
+
+    if not host or not user or not pwd:
+        _log.getLogger(__name__).warning("No SMTP configured — email to %s skipped (%s)", to, subject)
+        return False
+
+    msg = _MIMEText(body, "html")
+    msg["Subject"] = subject
+    msg["From"]    = f"{sender} <{user}>"
+    msg["To"]      = to
+    try:
+        if enc == "ssl":
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            with _smtp.SMTP_SSL(host, port, timeout=20, context=ctx) as srv:
+                srv.login(user, pwd)
+                srv.send_message(msg)
+        else:
+            with _smtp.SMTP(host, port, timeout=20) as srv:
+                srv.ehlo()
+                if enc != "none":
+                    srv.starttls()
+                srv.login(user, pwd)
+                srv.send_message(msg)
+        return True
+    except Exception as exc:
+        _log.getLogger(__name__).error("_send_center_email to %s failed: %s", to, exc)
+        return False
+
+
+@app.get("/admin/smtp-settings")
+def get_smtp_settings(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                      current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    caller = current.get("obj")
+    role = current.get("role", "")
+    if center_id and role == "super_admin":
+        cid = center_id
+    else:
+        cid = getattr(caller, "center_id", None)
+    return _get_smtp_for_center(db, cid)
+
+
+@app.put("/admin/smtp-settings")
+async def put_smtp_settings(request: Request, center_id: Optional[int] = None,
+                            db: Session = Depends(get_db),
+                            current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    body = await request.json()
+    caller = current.get("obj")
+    role = current.get("role", "")
+    if center_id and role == "super_admin":
+        cid = center_id
+    else:
+        cid = getattr(caller, "center_id", None)
+    prefix = _smtp_prefix(cid)
+
+    mapping = {
+        f"{prefix}host":        body.get("host", ""),
+        f"{prefix}port":        str(body.get("port", "587")),
+        f"{prefix}user":        body.get("user", ""),
+        f"{prefix}sender_name": body.get("sender_name", ""),
+        f"{prefix}encryption":  body.get("encryption", "tls"),
+    }
+    # Only update password if a real value was sent (not the masked placeholder)
+    raw_pass = body.get("pass", "")
+    if raw_pass and raw_pass != "••••••••":
+        mapping[f"{prefix}pass"] = raw_pass
+
+    for key, val in mapping.items():
+        row = db.query(AppSetting).filter(AppSetting.key == key).first()
+        if row:
+            row.value = val
+        else:
+            db.add(AppSetting(key=key, value=val))
+    db.commit()
+    return {"saved": True}
+
+
+@app.post("/admin/smtp-settings/test")
+async def test_smtp_settings(request: Request, db: Session = Depends(get_db),
+                             current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    body = await request.json()
+    to_email = (body.get("to_email") or "").strip()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="to_email is required")
+
+    caller = current.get("obj")
+    role = current.get("role", "")
+    req_center_id = body.get("center_id")
+    cid = (int(req_center_id) if req_center_id and role == "super_admin"
+           else getattr(caller, "center_id", None))
+
+    ok = _send_center_email(
+        db, cid, to_email,
+        "✅ SMTP test successful",
+        f"<p>Your SMTP settings are working correctly. Emails for this center will be sent from this account.</p>",
+    )
+    if not ok:
+        raise HTTPException(status_code=400,
+            detail="SMTP credentials not configured or send failed. Save valid SMTP settings first.")
+    return {"success": True, "message": f"Test email sent to {to_email}"}
 
 
 # ==================== Health ====================
