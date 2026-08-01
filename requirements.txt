@@ -16,7 +16,7 @@ pydantic[email]==2.5.3
 pydantic-settings==2.1.0
 
 # Payments
-razorpay==1.4.1
+razorpay==2.0.1
 
 # Testing
 pytest==7.4.3
