@@ -22,7 +22,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Staff, Student, AuthToken, AuditLog, LoginAttempt
+from models import Staff, Student, AuthToken, AuditLog, LoginAttempt, AppSetting
 import security
 
 logger = logging.getLogger("auth")
@@ -149,45 +149,93 @@ def send_email(to: str, subject: str, body: str):
         return False
 
 
-def _send_activation_email(to: str, name: str, raw_token: str):
+def _org_brand(db: Session, center_id: Optional[int] = None) -> dict:
+    """Academy name + logo for email branding, with per-center override."""
+    rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like("org.%")).all()}
+    academy = rows.get("org.academy_name") or "Vama Academy for Music & Performing Arts"
+    logo_url = rows.get("org.logo_url") or ""
+    if center_id:
+        prefix = f"center_{center_id}_org."
+        crows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all()}
+        academy = crows.get(f"{prefix}academy_name") or academy
+        logo_url = crows.get(f"{prefix}logo_url") or logo_url
+    return {"academy_name": academy, "logo_url": logo_url}
+
+
+def _branded_email_html(*, academy: str, logo_url: str, heading: str, intro: str,
+                        button_label: str, button_link: str, expiry_note: str) -> str:
+    """Professional, on-brand HTML shell shared by activation/reset emails —
+    mirrors the invoice email look (purple CTA, VAMA wordmark)."""
+    logo = (f"<img src='{logo_url}' alt='{academy}' style='max-height:48px'>"
+            if logo_url else
+            "<div style='font-size:22px;font-weight:900;letter-spacing:2px;color:#c0392b'>VAMA</div>"
+            "<div style='font-size:8px;letter-spacing:1px;color:#888'>ACADEMY FOR MUSIC &amp; PERFORMING ARTS</div>")
+    return f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a;background:#f6f5fb;padding:32px 0">
+      <div style="background:#fff;border-radius:12px;padding:36px;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+        <div style="text-align:center;margin-bottom:24px">{logo}</div>
+        <h2 style="font-size:20px;margin:0 0 12px;color:#1a1a1a">{heading}</h2>
+        <p style="font-size:14px;line-height:1.6;color:#444;margin:0 0 24px">{intro}</p>
+        <div style="text-align:center;margin:28px 0">
+          <a href="{button_link}" style="display:inline-block;background:#463a7a;color:#fff;text-decoration:none;
+             font-weight:700;padding:13px 32px;border-radius:8px;font-size:14px">{button_label}</a>
+        </div>
+        <p style="font-size:12px;color:#888;line-height:1.5;margin:0">{expiry_note}</p>
+      </div>
+      <p style="text-align:center;font-size:11px;color:#aaa;margin-top:20px">{academy}</p>
+    </div>"""
+
+
+def _send_activation_email(db: Session, to: str, name: str, raw_token: str, center_id: Optional[int] = None):
     link = f"{FRONTEND_URL}/activate?token={raw_token}"
-    send_email(
-        to,
-        "Activate your VAMA account",
-        f"""<p>Hi {name},</p>
-        <p>An account has been created for you. Set your password to activate it:</p>
-        <p><a href="{link}">Activate my account</a></p>
-        <p>This link expires in {security.TOKEN_EXPIRY_MINUTES} minutes and can be used once.</p>""",
+    brand = _org_brand(db, center_id)
+    html = _branded_email_html(
+        academy=brand["academy_name"], logo_url=brand["logo_url"],
+        heading=f"Welcome, {name}",
+        intro="An account has been created for you at " + brand["academy_name"] +
+              ". Set your password below to activate it and get started.",
+        button_label="Activate my account", button_link=link,
+        expiry_note=f"This link expires in {security.TOKEN_EXPIRY_MINUTES} minutes and can only be used once. "
+                     "If you weren't expecting this, you can safely ignore this email.",
     )
+    send_email(to, f"Activate your account — {brand['academy_name']}", html)
 
 
-def _send_reset_email(to: str, name: str, raw_token: str):
+def _send_reset_email(db: Session, to: str, name: str, raw_token: str, center_id: Optional[int] = None):
     link = f"{FRONTEND_URL}/reset-password?token={raw_token}"
-    send_email(
-        to,
-        "Reset your VAMA password",
-        f"""<p>Hi {name},</p>
-        <p>We received a request to reset your password. Click below to choose a new one:</p>
-        <p><a href="{link}">Reset my password</a></p>
-        <p>This link expires in {security.TOKEN_EXPIRY_MINUTES} minutes. If you didn't request this, ignore this email.</p>""",
+    brand = _org_brand(db, center_id)
+    html = _branded_email_html(
+        academy=brand["academy_name"], logo_url=brand["logo_url"],
+        heading=f"Reset your password, {name}",
+        intro="We received a request to reset the password on your account. Click below to choose a new one.",
+        button_label="Reset my password", button_link=link,
+        expiry_note=f"This link expires in {security.TOKEN_EXPIRY_MINUTES} minutes. "
+                     "If you didn't request this, you can safely ignore this email.",
     )
+    send_email(to, f"Reset your password — {brand['academy_name']}", html)
 
 
 # ══════════════════════════ Audit + login history ══════════════════════════
 
 def audit(db: Session, action: str, *, actor=None, subject=None,
-          request: Optional[Request] = None, detail: Optional[dict] = None):
+          request: Optional[Request] = None, detail: Optional[dict] = None,
+          center_id: Optional[int] = None):
     """Record a security-relevant event. actor/subject are (type, id) tuples."""
     ip = ua = None
     if request:
         ip = request.client.host if request.client else None
         ua = request.headers.get("user-agent")
+    # Fall back to center_id embedded in detail dict if not passed explicitly
+    resolved_center_id = center_id
+    if resolved_center_id is None and isinstance(detail, dict):
+        resolved_center_id = detail.get("center_id")
     db.add(AuditLog(
         action=action,
         actor_type=actor[0] if actor else None,
         actor_id=actor[1] if actor else None,
         subject_type=subject[0] if subject else None,
         subject_id=subject[1] if subject else None,
+        center_id=resolved_center_id,
         ip_address=ip, user_agent=ua,
         detail=json.dumps(detail) if detail else None,
     ))
@@ -286,7 +334,8 @@ def provision_account(db: Session, subject_type: str, obj, *, actor=None,
     activation_token = None
     if send_activation and obj.email:
         activation_token = issue_auth_token(db, subject_type, obj.id, "activation")
-        _send_activation_email(obj.email, display_name(subject_type, obj), activation_token)
+        _send_activation_email(db, obj.email, display_name(subject_type, obj), activation_token,
+                               center_id=getattr(obj, "center_id", None))
     return activation_token
 
 
@@ -441,7 +490,8 @@ async def forgot_password(request: Request, db: Session = Depends(get_db)):
     # Only act for activatable accounts, but never reveal which path we took.
     if obj and obj.account_status in (ACTIVE, PENDING):
         raw = issue_auth_token(db, subject_type, obj.id, "password_reset")
-        _send_reset_email(obj.email, display_name(subject_type, obj), raw)
+        _send_reset_email(db, obj.email, display_name(subject_type, obj), raw,
+                          center_id=getattr(obj, "center_id", None))
         audit(db, "password.reset_requested", subject=(subject_type, obj.id), request=request)
         db.commit()
     return {"message": "If an account exists for that email, a reset link has been sent."}

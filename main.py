@@ -231,14 +231,22 @@ def _run_migrations():
             fields_json TEXT NOT NULL,
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )""",
+        # ── Student enrollment lifecycle (active / on_break / dropped) ──
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS enrollment_status VARCHAR DEFAULT 'active'",
+        "ALTER TABLE student_packages ADD COLUMN IF NOT EXISTS paused_at VARCHAR",
+        "CREATE INDEX IF NOT EXISTS ix_students_enrollment_status ON students(enrollment_status)",
     ]
-    for sql in migrations:
-        try:
-            with engine.connect() as conn:
+    # One connection for the whole batch — opening a fresh connection per
+    # statement (105+ of them) is what made cold starts slow (each is a round
+    # trip to Neon). Roll back after a failed statement so the aborted
+    # transaction doesn't poison the ones that follow.
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
                 conn.execute(text(sql))
                 conn.commit()
-        except Exception:
-            pass
+            except Exception:
+                conn.rollback()
 
 
 def _seed_defaults():
@@ -613,15 +621,21 @@ async def teacher_login(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/students")
 def get_students(center_id: Optional[int] = None, page: Optional[int] = None, limit: int = 50,
+                exclude_dropped: bool = False,
                 db: Session = Depends(get_db),
                 current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
-    """List all students, optionally filtered by center. Phase 6: Paginated if page param provided."""
+    """List all students, optionally filtered by center. Phase 6: Paginated if page param provided.
+
+    exclude_dropped=true — used by booking/roster pickers so dropped students
+    don't show up as bookable; the main admin list keeps showing everyone."""
     q = db.query(Student)
     # Phase 1A: Center admin only sees their center's students
     if current.get("obj").access_role == "center_admin" and current.get("obj").center_id:
         q = q.filter(Student.center_id == current["obj"].center_id)
     elif center_id:
         q = q.filter(Student.center_id == center_id)
+    if exclude_dropped:
+        q = q.filter(Student.enrollment_status != "dropped")
 
     extras = _profile_extras_map(db)
 
@@ -645,6 +659,7 @@ def get_students(center_id: Optional[int] = None, page: Optional[int] = None, li
             "is_exam_student": s.is_exam_student or False,
             "exam_date": s.exam_date,
             "teacher_id": s.teacher_id,
+            "enrollment_status": s.enrollment_status or "active",
             "created_at": s.created_at.isoformat() if s.created_at else "",
             **_extra_fields_dict(extras.get(s.id)),
         }
@@ -753,6 +768,7 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
             "teacher_name": staff_map.get(s.teacher_id),
             "center_id": s.center_id,
             "center_name": center_map.get(s.center_id),
+            "enrollment_status": s.enrollment_status or "active",
             "progress_done": done, "progress_total": total,
             "progress_pct": round(done / total * 100) if total else 0,
             "portal_ready": bool(s.instrument and s.teacher_id),
@@ -1112,6 +1128,109 @@ async def update_student(student_id: int, request: Request, db: Session = Depend
         }
 
     raise HTTPException(status_code=404, detail="Student not found")
+
+
+def _pause_student_package(db: Session, student_id: int):
+    """Pause the student's active package — stops session/expiry consumption."""
+    from datetime import date as _date
+    sp = db.query(StudentPackage).filter(
+        StudentPackage.student_id == student_id, StudentPackage.status == "active"
+    ).first()
+    if sp:
+        sp.status = "paused"
+        sp.paused_at = str(_date.today())
+
+
+def _resume_student_package(db: Session, student_id: int):
+    """Unpause the most recently paused package, extending end_date by however
+    many days it was paused so validity isn't lost while inactive."""
+    from datetime import date as _date, datetime as _dt, timedelta as _td
+    sp = db.query(StudentPackage).filter(
+        StudentPackage.student_id == student_id, StudentPackage.status == "paused",
+        StudentPackage.paused_at.isnot(None),
+    ).order_by(StudentPackage.updated_at.desc()).first()
+    if not sp:
+        return
+    today = _date.today()
+    try:
+        paused_since = _dt.strptime(sp.paused_at, "%Y-%m-%d").date()
+        days_paused = (today - paused_since).days
+    except (TypeError, ValueError):
+        days_paused = 0
+    if sp.end_date and days_paused > 0:
+        try:
+            new_end = _dt.strptime(sp.end_date, "%Y-%m-%d").date()
+            sp.end_date = str(new_end + _td(days=days_paused))
+        except ValueError:
+            pass
+    sp.status = "active"
+    sp.paused_at = None
+
+
+def _clear_active_roster(db: Session, student_id: int):
+    """Deactivate every active class enrollment — removes them from booking
+    rosters immediately (used when a student goes on_break or is dropped)."""
+    db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.status == "active",
+    ).update({"status": "cancelled"}, synchronize_session=False)
+
+
+def _reactivate_student_if_needed(db: Session, student_id: int):
+    """Call this after a student gains a roster slot (booked/added to a class).
+    A fresh booking is a clear signal someone intends them to resume, so
+    on_break/dropped auto-flips back to active — no separate manual step
+    needed. Mirrors the 'active' branch of set_student_enrollment_status."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student or (student.enrollment_status or "active") == "active":
+        return
+    if student.enrollment_status == "on_break":
+        _resume_student_package(db, student_id)
+    student.enrollment_status = "active"
+
+
+@app.put("/students/{student_id}/enrollment-status")
+async def set_student_enrollment_status(student_id: int, request: Request, db: Session = Depends(get_db),
+                                        current = Depends(require_roles("super_admin", "center_admin"))):
+    """Set a student's lifecycle state: active | on_break | dropped.
+
+    on_break  — pauses their active package (stops session/expiry consumption),
+                immediately clears them off booking rosters, and suppresses
+                payment/package warnings until resumed.
+    dropped   — clears them off booking rosters and suppresses warnings, keeps
+                all history intact.
+    active    — resumes from on_break: unpauses the package and extends its
+                end_date by however long it was paused, so they don't lose
+                validity days they weren't using. (Also happens automatically
+                the moment they're added back into any class roster — see
+                _reactivate_student_if_needed.)
+    """
+    body = await request.json()
+    new_status = body.get("status")
+    if new_status not in ("active", "on_break", "dropped"):
+        raise HTTPException(status_code=400, detail="status must be one of: active, on_break, dropped")
+
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    old_status = student.enrollment_status or "active"
+
+    if new_status == "on_break" and old_status != "on_break":
+        _pause_student_package(db, student_id)
+        _clear_active_roster(db, student_id)
+
+    elif new_status == "active" and old_status == "on_break":
+        _resume_student_package(db, student_id)
+
+    elif new_status == "dropped" and old_status != "dropped":
+        _clear_active_roster(db, student_id)
+
+    student.enrollment_status = new_status
+    audit(db, "student.enrollment_status_changed", subject=("staff", current["id"]), request=request,
+          detail={"student_id": student_id, "from": old_status, "to": new_status, "notes": body.get("notes")})
+    db.commit()
+    db.refresh(student)
+    return {"id": student.id, "enrollment_status": student.enrollment_status}
 
 
 # ==================== Form Builder / Form Config ====================
@@ -1632,8 +1751,14 @@ def assert_can_book(db: Session, student_id: int, session, count: int = 1, is_ma
 
 def student_warnings(db: Session, student_id: int) -> list:
     """Non-blocking advisories for the admin UI: expired/exhausted/low package,
-    makeup limit reached, and overdue invoices."""
+    makeup limit reached, and overdue invoices.
+
+    Suppressed entirely for students on_break/dropped — they're intentionally
+    not attending, so package/payment nags would just be noise."""
     from datetime import date as _date
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student and student.enrollment_status in ("on_break", "dropped"):
+        return []
     out = []
     sp = get_active_student_package(db, student_id, persist=False)
     if not sp:
@@ -3233,6 +3358,10 @@ def enroll_student_in_session(
     if not db.query(Student).filter(Student.id == student_id).first():
         raise HTTPException(status_code=404, detail="Student not found")
 
+    # Being booked into a class is a signal to resume — do this before the
+    # package gate below so a previously paused package is active again.
+    _reactivate_student_if_needed(db, student_id)
+
     if enrollment_type == "recurring" and sess.batch_id:
         # Find all sessions in this batch that share the SAME weekday AND start_time
         try:
@@ -4095,6 +4224,7 @@ async def enroll_in_template(template_id: int, request: Request, db: Session = D
     else:
         db.add(Enrollment(template_id=template_id, student_id=student_id,
                           status="active", start_date=body.get("start_date") or _d.today().isoformat()))
+    _reactivate_student_if_needed(db, student_id)
     db.commit()
     return {"message": "Enrolled"}
 
@@ -4126,6 +4256,8 @@ async def add_student_scoped(occ_id: int, request: Request, db: Session = Depend
             raise HTTPException(status_code=400, detail=f"Class on {occ.date} is full ({len(roster)}/{cap})")
         _set_membership(db, occ, student_id, present=True, base_ids=base)
         added += 1
+    if added:
+        _reactivate_student_if_needed(db, student_id)
     db.commit()
     return {"message": "Added", "occurrences_affected": added, "scope": scope}
 
@@ -4519,6 +4651,54 @@ async def update_package(pkg_id: int, request: Request, db: Session = Depends(ge
 
 
 # ==================== Student Package Lifecycle (Admin) ====================
+
+@app.get("/admin/payments/attendance-overages")
+def admin_attendance_overages(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                              current = Depends(require_roles("super_admin", "center_admin"))):
+    """Students who have attended more sessions than their package covers —
+    e.g. a teacher/admin marked them present (bypass_package) after their
+    package ran out. These need a follow-up invoice/renewal.
+
+    Excludes students on_break/dropped (they're intentionally not billed)."""
+    caller = current.get("obj")
+    if getattr(caller, "access_role", None) == "center_admin":
+        center_id = caller.center_id
+
+    q = db.query(StudentPackage).filter(StudentPackage.status == "active")
+    sps = q.all()
+
+    results = []
+    for sp in sps:
+        student = db.query(Student).filter(Student.id == sp.student_id).first()
+        if not student or student.enrollment_status in ("on_break", "dropped"):
+            continue
+        if center_id and student.center_id != center_id:
+            continue
+        state = resolve_package_state(db, sp)
+        if not state or state["sessions_remaining"] >= 0:
+            continue
+        last_att_date = (
+            db.query(ClassOccurrence.date)
+            .join(Attendance, Attendance.session_id == ClassOccurrence.id)
+            .filter(Attendance.student_id == student.id, Attendance.status == "present",
+                    ClassOccurrence.date >= sp.start_date)
+            .order_by(ClassOccurrence.date.desc())
+            .first()
+        )
+        results.append({
+            "student_id": student.id,
+            "student_name": f"{student.first_name} {student.last_name}".strip(),
+            "center_id": student.center_id,
+            "package_id": sp.package_id,
+            "package_name": state["package_name"],
+            "sessions_total": state["sessions_total"],
+            "sessions_used": state["sessions_used"],
+            "overage": -state["sessions_remaining"],
+            "last_attended_date": last_att_date[0] if last_att_date else None,
+        })
+    results.sort(key=lambda r: r["overage"], reverse=True)
+    return results
+
 
 @app.get("/admin/student/{student_id}/packages")
 def admin_list_student_packages(student_id: int, db: Session = Depends(get_db)):
@@ -5999,7 +6179,9 @@ def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
 
     now = _dt.utcnow()
 
-    # ── time-range start date string (YYYY-MM-DD) ──────────────────────────────
+    # ── time-range start date string (YYYY-MM-DD), plus the equal-length prior
+    # period immediately before it, so KPI trends compare like-for-like. ──────
+    period_days = {"today": 1, "week": 7, "quarter": 90, "half": 180}
     if period == "today":
         start_str = now.strftime("%Y-%m-%d")
     elif period == "week":
@@ -6014,6 +6196,23 @@ def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
         start_str = now.replace(month=1, day=1).strftime("%Y-%m-%d")
     else:
         start_str = None
+
+    prev_start_str = None
+    if start_str:
+        start_dt = _dt.strptime(start_str, "%Y-%m-%d")
+        if period in period_days:
+            prev_start_str = (start_dt - _td(days=period_days[period])).strftime("%Y-%m-%d")
+        elif period == "month":
+            prev_month_end = start_dt - _td(days=1)
+            prev_start_str = prev_month_end.replace(day=1).strftime("%Y-%m-%d")
+        elif period == "year":
+            prev_start_str = start_dt.replace(year=start_dt.year - 1).strftime("%Y-%m-%d")
+
+    def _pct_change(cur, prev):
+        """Real period-over-period % change, or None when there's nothing to compare."""
+        if prev in (None, 0):
+            return None
+        return round((cur - prev) / prev * 100, 1)
 
     # ── pre-fetch everything once ──────────────────────────────────────────────
     all_invoices   = db.query(Invoice).order_by(Invoice.id.desc()).all()
@@ -6034,6 +6233,31 @@ def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
     )
     overdue_all    = [i for i in all_invoices if i.status == "overdue"]
     active_subs    = [s for s in all_subs if s.status == "active"]
+
+    # ── previous-period slice, for real (not cosmetic) trend arrows ───────────
+    prev_invoiced = prev_received = prev_due = prev_overdue_amt = None
+    prev_active_subs_count = None
+    if prev_start_str:
+        prev_invs = [i for i in all_invoices
+                    if i.issue_date and prev_start_str <= i.issue_date < start_str]
+        prev_invoiced = sum(i.total_amount or 0 for i in prev_invs)
+        prev_received = sum(i.paid_amount  or 0 for i in prev_invs)
+        prev_due      = sum(
+            max(0, (i.total_amount or 0) - (i.paid_amount or 0))
+            for i in prev_invs if i.status not in ("paid", "cancelled")
+        )
+        # "Overdue" isn't period-filtered above, so its trend compares invoices
+        # that became due in this period vs the equivalent prior window.
+        cur_overdue_amt = sum(i.total_amount or 0 for i in overdue_all
+                              if i.due_date and start_str <= i.due_date <= now.strftime("%Y-%m-%d"))
+        prev_overdue_amt = sum(i.total_amount or 0 for i in overdue_all
+                               if i.due_date and prev_start_str <= i.due_date < start_str)
+        # Active-subs trend: subscriptions started this period vs prior period.
+        cur_new_subs = sum(1 for s in all_subs if s.created_at and s.created_at.strftime("%Y-%m-%d") >= start_str)
+        prev_active_subs_count = sum(
+            1 for s in all_subs if s.created_at
+            and prev_start_str <= s.created_at.strftime("%Y-%m-%d") < start_str
+        )
 
     # ── upcoming renewals (next 30 days) ──────────────────────────────────────
     upcoming_renewals = []
@@ -6142,17 +6366,31 @@ def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
             "status":         inv.status,
         })
 
+    # ── real session utilization — live from attendance via StudentPackage,
+    # not the Subscription.sessions_used counter (which nothing ever updates). ─
+    active_packages = db.query(StudentPackage).filter(StudentPackage.status == "active").all()
+    pkg_states = [resolve_package_state(db, sp) for sp in active_packages]
+    sessions_total_live = sum(st["sessions_total"] for st in pkg_states if st)
+    sessions_used_live  = sum(st["sessions_used"]  for st in pkg_states if st)
+
+    overdue_amount = round(sum(i.total_amount or 0 for i in overdue_all), 2)
+
     return {
         "kpi": {
             "totalInvoiced":       round(total_invoiced, 2),
+            "totalInvoicedTrend":  _pct_change(total_invoiced, prev_invoiced),
             "totalReceived":       round(total_received, 2),
+            "totalReceivedTrend":  _pct_change(total_received, prev_received),
             "totalDue":            round(total_due, 2),
-            "overdue":             round(sum(i.total_amount or 0 for i in overdue_all), 2),
+            "totalDueTrend":       _pct_change(total_due, prev_due),
+            "overdue":             overdue_amount,
+            "overdueTrend":        _pct_change(cur_overdue_amt, prev_overdue_amt) if prev_start_str else None,
             "overdueCount":        len(overdue_all),
             "activeSubscriptions": len(active_subs),
+            "activeSubsTrend":     _pct_change(cur_new_subs, prev_active_subs_count) if prev_start_str else None,
             "upcomingRenewals":    len(upcoming_renewals),
-            "sessionsTotal":       sum(s.sessions_total or 0 for s in active_subs),
-            "sessionsUsed":        sum(s.sessions_used  or 0 for s in active_subs),
+            "sessionsTotal":       sessions_total_live,
+            "sessionsUsed":        sessions_used_live,
             "collectionRate":      round(total_received / total_invoiced * 100, 1) if total_invoiced > 0 else 0,
         },
         "allInvoicesCount":  len(all_invoices),

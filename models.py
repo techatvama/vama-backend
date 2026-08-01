@@ -68,6 +68,7 @@ class Student(Base):
     password = Column(String, nullable=True)            # legacy plaintext — deprecated, do not use
     password_hash = Column(String, nullable=True)        # Argon2id hash
     account_status = Column(String, default="pending_activation")  # pending_activation | active | suspended | disabled
+    enrollment_status = Column(String, default="active")  # active | on_break | dropped
     failed_login_count = Column(Integer, default=0)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     current_grade = Column(String, nullable=True, default='Debut')
@@ -359,6 +360,7 @@ class StudentPackage(Base):
     sessions_used = Column(Integer, default=0)  # legacy/denormalized — used-count is computed live from attendance
     makeup_used = Column(Integer, default=0)
     status = Column(String, default="active")  # active | expired | exhausted | cancelled | paused
+    paused_at = Column(String, nullable=True)  # date (YYYY-MM-DD) the package was paused for a student break
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -478,6 +480,7 @@ class AuditLog(Base):
     actor_id = Column(Integer, nullable=True)
     subject_type = Column(String, nullable=True)         # who/what it was done to
     subject_id = Column(Integer, nullable=True)
+    center_id = Column(Integer, nullable=True, index=True)
     ip_address = Column(String, nullable=True)
     user_agent = Column(String, nullable=True)
     detail = Column(Text, nullable=True)                 # JSON blob of extra context
