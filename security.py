@@ -75,7 +75,7 @@ def validate_password_strength(password: str) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_INSECURE_DEV_SECRET")
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "15"))
+ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "60"))
 REFRESH_TOKEN_DAYS = int(os.getenv("REFRESH_TOKEN_DAYS", "7"))
 
 

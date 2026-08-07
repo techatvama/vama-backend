@@ -321,9 +321,16 @@ def consume_auth_token(db: Session, raw_token: str, purpose: str) -> AuthToken:
 # ══════════════════════════ Account creation (called by hooks) ══════════════════════════
 
 def provision_account(db: Session, subject_type: str, obj, *, actor=None,
-                      request: Optional[Request] = None, send_activation: bool = True):
+                      request: Optional[Request] = None, send_activation: bool = True,
+                      notify_email: Optional[str] = None):
     """Initialise a freshly-created identity as a pending account and send the
     activation email. Caller is responsible for committing the session.
+
+    notify_email: deliver the activation email here instead of obj.email.
+    Used for sibling accounts whose stored `email` is a synthetic, unique
+    login handle derived from the family's real address — the real address
+    (kept on notify_email/guardian_email) is what must actually receive mail.
+
     Returns the raw activation token for dev/UI use."""
     obj.account_status = PENDING
     obj.password_hash = None
@@ -332,9 +339,10 @@ def provision_account(db: Session, subject_type: str, obj, *, actor=None,
           subject=(subject_type, obj.id), request=request,
           detail={"email": obj.email, "roles": roles_for(subject_type, obj)})
     activation_token = None
-    if send_activation and obj.email:
+    deliver_to = notify_email or obj.email
+    if send_activation and deliver_to:
         activation_token = issue_auth_token(db, subject_type, obj.id, "activation")
-        _send_activation_email(db, obj.email, display_name(subject_type, obj), activation_token,
+        _send_activation_email(db, deliver_to, display_name(subject_type, obj), activation_token,
                                center_id=getattr(obj, "center_id", None))
     return activation_token
 

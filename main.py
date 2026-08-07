@@ -35,7 +35,7 @@ from models import (
     Room, Holiday, ClassTemplate, RecurrenceRule, ClassOccurrence,
     Enrollment, StudentInstructor,
     InvoiceItem, InvoiceInstallment, InvoicePayment, PaymentMode, InvoiceTemplate,
-    StudentApplication, LearningEnrollment, CenterFormConfig
+    StudentApplication, LearningEnrollment, CenterFormConfig, AuthToken
 )
 import scheduling
 import crud
@@ -539,11 +539,13 @@ async def student_login(request: Request, db: Session = Depends(get_db)):
     roles = roles_for("student", student)
     sub = f"student:{student.id}"
     access_token = security.create_access_token(sub, roles)
+    refresh_token = security.create_refresh_token(sub)
 
     db.commit()
 
     return {
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "student": {
             "id": student.id,
@@ -599,11 +601,13 @@ async def teacher_login(request: Request, db: Session = Depends(get_db)):
     roles = roles_for("staff", teacher)
     sub = f"staff:{teacher.id}"
     access_token = security.create_access_token(sub, roles)
+    refresh_token = security.create_refresh_token(sub)
 
     db.commit()
 
     return {
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "bearer",
         "teacher": {
             "id": teacher.id,
@@ -974,17 +978,40 @@ def remove_student_instructor(student_id: int, track_id: int, db: Session = Depe
     return {"message": "Instructor removed"}
 
 
+def _unique_sibling_login_email(db: Session, family_email: str, first_name: str) -> str:
+    """Derive a unique, still-valid login email for a sibling whose family
+    only has one real address. Real mail always goes to family_email
+    (passed as notify_email to provision_account) — this value only needs
+    to be unique, not deliverable."""
+    import re as _re
+    local, _, domain = family_email.partition("@")
+    tag = _re.sub(r"[^a-z0-9]", "", (first_name or "").lower()) or "sibling"
+    candidate = f"{local}+{tag}@{domain}"
+    n = 2
+    while email_exists(db, candidate):
+        candidate = f"{local}+{tag}{n}@{domain}"
+        n += 1
+    return candidate
+
+
 @app.post("/students")
 async def create_student(request: Request, db: Session = Depends(get_db),
                         current = Depends(require_roles("super_admin", "center_admin"))):
-    """Create a new student in the database and provision a pending-activation account."""
+    """Create a new student in the database and provision a pending-activation account.
+
+    A family's real email can be reused across siblings: if it's already taken
+    by another student, a unique-but-undeliverable login email is derived for
+    this one (see _unique_sibling_login_email), the real address is kept on
+    guardian_email (linking them for the child-switcher — see linked_students),
+    and the activation email still always goes to the real address."""
     body = await request.json()
-    email = (body.get("email") or "").strip()
-    if not email:
+    family_email = (body.get("email") or "").strip().lower()
+    if not family_email:
         raise HTTPException(status_code=400, detail="A valid email address is required")
-    # Email must be unique across the entire system (staff/students/parents).
-    if email_exists(db, email):
-        raise HTTPException(status_code=400, detail="An account with this email already exists")
+
+    login_email = family_email
+    if email_exists(db, family_email):
+        login_email = _unique_sibling_login_email(db, family_email, body.get("first_name"))
 
     # Center admins automatically assign new students to their center.
     caller = current.get("obj")
@@ -995,8 +1022,8 @@ async def create_student(request: Request, db: Session = Depends(get_db),
     student = Student(
         first_name=body.get("first_name", ""),
         last_name=body.get("last_name", ""),
-        email=email,
-        guardian_email=(body.get("guardian_email") or "").strip().lower() or None,
+        email=login_email,
+        guardian_email=(body.get("guardian_email") or "").strip().lower() or family_email,
         primary_phone_number=body.get("primary_phone_number", ""),
         gender=body.get("gender"),
         address=body.get("address"),
@@ -1010,7 +1037,8 @@ async def create_student(request: Request, db: Session = Depends(get_db),
     )
     db.add(student)
     # No default password — provision a pending account + send activation email.
-    provision_account(db, "student", student, request=request)
+    # Always notify the real family address, even when `email` is a synthetic sibling handle.
+    provision_account(db, "student", student, request=request, notify_email=family_email)
     if any(f in body for f in EXTRA_PROFILE_FIELDS):
         extra = StudentApplication(
             first_name=student.first_name, last_name=student.last_name, email=student.email,
@@ -1231,6 +1259,59 @@ async def set_student_enrollment_status(student_id: int, request: Request, db: S
     db.commit()
     db.refresh(student)
     return {"id": student.id, "enrollment_status": student.enrollment_status}
+
+
+def _hard_delete_student(db: Session, student: "Student"):
+    """Permanently remove a student and every row that references them:
+    invoices (DB-level CASCADE clears items/installments/payments), packages,
+    subscriptions, progress/grade history, class enrollments, attendance,
+    materials, and auth tokens. Intake applications are unlinked, not deleted,
+    since they carry marketing/intake analytics independent of the student."""
+    sid = student.id
+    db.query(Invoice).filter(Invoice.student_id == sid).delete(synchronize_session=False)
+    db.query(StudentPackage).filter(StudentPackage.student_id == sid).delete(synchronize_session=False)
+    db.query(Subscription).filter(Subscription.student_id == sid).delete(synchronize_session=False)
+    db.query(StudentProgress).filter(StudentProgress.student_id == sid).delete(synchronize_session=False)
+    db.query(StudentGradeHistory).filter(StudentGradeHistory.student_id == sid).delete(synchronize_session=False)
+    db.query(StudentEnrollment).filter(StudentEnrollment.student_id == sid).delete(synchronize_session=False)
+    db.query(Enrollment).filter(Enrollment.student_id == sid).delete(synchronize_session=False)
+    db.query(StudentInstructor).filter(StudentInstructor.student_id == sid).delete(synchronize_session=False)
+    db.query(LearningEnrollment).filter(LearningEnrollment.student_id == sid).delete(synchronize_session=False)
+    db.query(Material).filter(Material.student_id == sid).delete(synchronize_session=False)
+    db.query(Attendance).filter(Attendance.student_id == sid).delete(synchronize_session=False)
+    db.query(StudentApplication).filter(StudentApplication.student_id == sid).update(
+        {"student_id": None}, synchronize_session=False)
+    db.query(AuthToken).filter(AuthToken.subject_type == "student", AuthToken.subject_id == sid).delete(synchronize_session=False)
+    db.delete(student)
+
+
+@app.post("/students/bulk-delete")
+async def bulk_delete_students(request: Request, db: Session = Depends(get_db),
+                               current = Depends(require_roles("super_admin"))):
+    """Permanently delete multiple students and all their linked records.
+    Irreversible — super_admin only. Each id is processed in its own
+    transaction so one failure doesn't roll back the rest of the batch."""
+    body = await request.json()
+    ids = body.get("student_ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="student_ids must be a non-empty list")
+
+    results = []
+    for sid in ids:
+        student = db.query(Student).filter(Student.id == sid).first()
+        if not student:
+            results.append({"id": sid, "ok": False, "message": "Not found"})
+            continue
+        snapshot = {"student_id": sid, "name": f"{student.first_name} {student.last_name}", "email": student.email}
+        try:
+            _hard_delete_student(db, student)
+            audit(db, "student.deleted", subject=("staff", current["id"]), request=request, detail=snapshot)
+            db.commit()
+            results.append({"id": sid, "ok": True})
+        except Exception as e:
+            db.rollback()
+            results.append({"id": sid, "ok": False, "message": str(e)})
+    return {"results": results}
 
 
 # ==================== Form Builder / Form Config ====================
@@ -6539,6 +6620,18 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
         ).hexdigest()
         if generated != razorpay_signature:
             raise HTTPException(status_code=400, detail="Payment verification failed")
+
+    # Confirm the payment was actually captured (signature match alone doesn't
+    # guarantee capture — it can still be "authorized", "failed", etc.)
+    if not test_mode and razorpay_payment_id:
+        import razorpay
+        rzp_client = razorpay.Client(auth=(rzp["key_id"] or "rzp_test_placeholder", key_secret))
+        try:
+            payment = rzp_client.payment.fetch(razorpay_payment_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Unable to confirm payment status with Razorpay")
+        if payment.get("status") != "captured":
+            raise HTTPException(status_code=400, detail=f"Payment not captured (status: {payment.get('status')})")
 
     # Fetch package details
     pkg = db.query(Package).filter(Package.id == package_id).first()
