@@ -12,12 +12,6 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-from logging_config import setup_logging, setup_performance_logging, get_logger
-
-setup_logging()
-setup_performance_logging()
-app_logger = get_logger()
-
 app = FastAPI()
 
 app.add_middleware(
@@ -30,10 +24,6 @@ app.add_middleware(
 
 _osmod.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-from performance_middleware import api_performance_middleware
-
-app.middleware("http")(api_performance_middleware)
 
 # ==================== DB Setup ====================
 from database import engine, get_db, Base, SessionLocal
@@ -61,7 +51,6 @@ app.include_router(_enrollment_module.router)
 
 @app.on_event("startup")
 async def startup_event():
-    app_logger.info("APPLICATION STARTED")
     try:
         Base.metadata.create_all(bind=engine)
         _run_migrations()
@@ -71,11 +60,6 @@ async def startup_event():
         print("✅ Database ready")
     except Exception as e:
         print(f"❌ Startup error: {e}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    app_logger.info("APPLICATION SHUTDOWN")
 
 
 def _run_migrations():
