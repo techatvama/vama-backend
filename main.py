@@ -2,14 +2,21 @@ from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, 
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text, func
+from sqlalchemy import text, func, or_, not_
 from sqlalchemy.orm import Session
 from typing import Optional
 import os as _osmod
+import uuid
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+from logging_config import setup_logging, setup_performance_logging, get_logger
+
+setup_logging()
+setup_performance_logging()
+app_logger = get_logger()
 
 app = FastAPI()
 
@@ -23,6 +30,10 @@ app.add_middleware(
 
 _osmod.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+from performance_middleware import api_performance_middleware
+
+app.middleware("http")(api_performance_middleware)
 
 # ==================== DB Setup ====================
 from database import engine, get_db, Base, SessionLocal
@@ -50,6 +61,7 @@ app.include_router(_enrollment_module.router)
 
 @app.on_event("startup")
 async def startup_event():
+    app_logger.info("APPLICATION STARTED")
     try:
         Base.metadata.create_all(bind=engine)
         _run_migrations()
@@ -59,6 +71,11 @@ async def startup_event():
         print("✅ Database ready")
     except Exception as e:
         print(f"❌ Startup error: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    app_logger.info("APPLICATION SHUTDOWN")
 
 
 def _run_migrations():
@@ -235,6 +252,9 @@ def _run_migrations():
         "ALTER TABLE students ADD COLUMN IF NOT EXISTS enrollment_status VARCHAR DEFAULT 'active'",
         "ALTER TABLE student_packages ADD COLUMN IF NOT EXISTS paused_at VARCHAR",
         "CREATE INDEX IF NOT EXISTS ix_students_enrollment_status ON students(enrollment_status)",
+        # ── Per-student makeup tracking (roster override + attendance record) ──
+        "ALTER TABLE class_enrollments ADD COLUMN IF NOT EXISTS is_makeup BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE attendances ADD COLUMN IF NOT EXISTS is_makeup BOOLEAN DEFAULT FALSE",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -1678,16 +1698,24 @@ def makeup_used_for_package(db: Session, sp: "StudentPackage") -> int:
 
 def _consumption_count(db: Session, sp, makeup: bool) -> int:
     """Present attendances joined to OCCURRENCES (the v2 source of truth, not the
-    legacy class_sessions) within the package window, split by regular vs makeup."""
+    legacy class_sessions) within the package window, split by regular vs makeup.
+
+    Makeup-ness is per-student (Attendance.is_makeup, set from the booking's
+    Enrollment override — see _set_membership) OR'd with the occurrence-level
+    flag (ClassOccurrence.is_makeup) for any dedicated makeup-only occurrence
+    an admin creates directly. A shared regular occurrence can be a makeup for
+    one student and a normal class for everyone else, which is why this can't
+    be occurrence-level alone."""
     if not sp:
         return 0
+    is_makeup_expr = or_(Attendance.is_makeup.is_(True), ClassOccurrence.is_makeup.is_(True))
     q = (
         db.query(Attendance)
         .join(ClassOccurrence, Attendance.session_id == ClassOccurrence.id)
         .filter(
             Attendance.student_id == sp.student_id,
             Attendance.status == "present",
-            ClassOccurrence.is_makeup == (True if makeup else False),
+            is_makeup_expr if makeup else not_(is_makeup_expr),
             ClassOccurrence.date >= sp.start_date,
         )
     )
@@ -2559,17 +2587,39 @@ def _slot_counts(db, occ):
     return cap, cnt
 
 
+def _student_is_free_for(db, student_id, occ, exclude_occurrence_id, date_cache):
+    """True if the student can be offered `occ` as a bookable slot: not already
+    on its roster, and no time overlap with anything else they're booked into
+    that date. `date_cache` memoizes the per-date occurrence lookup across a
+    batch of candidate slots sharing the same date range."""
+    if student_id in _occurrence_roster_ids(db, occ):
+        return False
+    if occ.date not in date_cache:
+        date_cache[occ.date] = _student_effective_occurrences_on_date(
+            db, student_id, occ.date, exclude_ids={occ.id, exclude_occurrence_id} if exclude_occurrence_id else {occ.id}
+        )
+    for o in date_cache[occ.date]:
+        if _times_overlap(occ.start_time, occ.end_time, o.start_time, o.end_time):
+            return False
+    return True
+
+
 @app.get("/student/{student_id}/instructor-slots")
 def student_instructor_slots(student_id: int, session_id: int, slot_date: str, db: Session = Depends(get_db)):
     """Bookable slots on a date with the same instructor as `session_id`.
-    Cancelled occurrences are never returned."""
+    Cancelled, already-booked, and time-conflicting occurrences are never
+    returned — `session_id` (the slot being rescheduled away from) doesn't
+    count as a conflict against itself."""
     orig = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
     q = _bookable_occurrences_query(db).filter(ClassOccurrence.date == slot_date)
     if orig and orig.teacher_id:
         q = q.filter(ClassOccurrence.teacher_id == orig.teacher_id)
     out = []
+    date_cache = {}
     for o in q.all():
         if o.id == session_id:
+            continue
+        if not _student_is_free_for(db, student_id, o, session_id, date_cache):
             continue
         t = o.template
         cap, cnt = _slot_counts(db, o)
@@ -2585,7 +2635,8 @@ def student_instructor_slots(student_id: int, session_id: int, slot_date: str, d
 @app.get("/student/{student_id}/available-slots")
 def student_available_slots(student_id: int, start: Optional[str] = None, end: Optional[str] = None,
                             subject: Optional[str] = None, db: Session = Depends(get_db)):
-    """Bookable slots in a date range, optionally by subject. Cancelled excluded."""
+    """Bookable slots in a date range, optionally by subject. Cancelled,
+    already-booked, and time-conflicting occurrences are excluded."""
     staff_map = {s.id: s.name for s in db.query(Staff).all()}
     q = _bookable_occurrences_query(db)
     if start:
@@ -2593,9 +2644,12 @@ def student_available_slots(student_id: int, start: Optional[str] = None, end: O
     if end:
         q = q.filter(ClassOccurrence.date <= end)
     out = []
+    date_cache = {}
     for o in q.order_by(ClassOccurrence.date, ClassOccurrence.start_time).all():
         t = o.template
         if subject and t and (t.course or "") != subject:
+            continue
+        if not _student_is_free_for(db, student_id, o, None, date_cache):
             continue
         cap, cnt = _slot_counts(db, o)
         out.append({
@@ -2606,7 +2660,7 @@ def student_available_slots(student_id: int, start: Optional[str] = None, end: O
     return out
 
 
-def _student_reschedule(db, student_id, old_id, new_id):
+def _student_reschedule(db, student_id, old_id, new_id, is_makeup=True):
     old = db.query(ClassOccurrence).filter(ClassOccurrence.id == old_id).first()
     new = db.query(ClassOccurrence).filter(ClassOccurrence.id == new_id).first()
     if not new:
@@ -2618,9 +2672,10 @@ def _student_reschedule(db, student_id, old_id, new_id):
     cap = new.template.capacity if new.template else None
     if cap and student_id not in roster_new and len(roster_new) >= cap:
         raise HTTPException(status_code=400, detail="That slot is fully booked")
+    _assert_no_conflict(db, student_id, new, exclude_occurrence_id=old_id)
     if old:
         _set_membership(db, old, student_id, present=False, base_ids=_baseline_ids(db, old.template_id))
-    _set_membership(db, new, student_id, present=True, base_ids=base_new)
+    _set_membership(db, new, student_id, present=True, base_ids=base_new, is_makeup=is_makeup)
     db.commit()
     return {"message": "Rescheduled"}
 
@@ -2658,6 +2713,7 @@ def student_package_status(student_id: int, db: Session = Depends(get_db)):
             "days_left": None,
             "package_name": None,
             "status": reason,
+            "cancellation_window_hours": (last.package.cancellation_window_hours if last and last.package else 24) or 24,
         }
 
     state = resolve_package_state(db, sp)
@@ -2668,6 +2724,9 @@ def student_package_status(student_id: int, db: Session = Depends(get_db)):
     if sp.end_date:
         delta = (_date.fromisoformat(sp.end_date) - _date.today()).days
         days_left = max(0, delta)
+
+    pkg = db.query(Package).filter(Package.id == sp.package_id).first()
+    cancellation_window_hours = (pkg.cancellation_window_hours if pkg and pkg.cancellation_window_hours is not None else 24)
 
     return {
         "can_book": can_book,
@@ -2682,6 +2741,7 @@ def student_package_status(student_id: int, db: Session = Depends(get_db)):
         "end_date": sp.end_date,
         "days_left": days_left,
         "status": state["effective_status"],
+        "cancellation_window_hours": cancellation_window_hours,
     }
 
 
@@ -3571,19 +3631,40 @@ def mark_attendance(
         Attendance.student_id == student_id
     ).first()
 
+    # Resolve the underlying session: legacy ClassSession, or a v2
+    # ClassOccurrence (ids are shared/mirrored — see models.py). Without this
+    # fallback, v2-only occurrence ids silently skip the validity-window
+    # check inside assert_can_book below (session would resolve to None).
+    session = db.query(ClassSession).filter(ClassSession.id == session_id).first()
+    occ_for_makeup = None
+    if not session:
+        occ_for_makeup = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
+        session = occ_for_makeup
+
     # Enforce the package guard only when this mark newly consumes a session
     # (going to 'present' from absent/unmarked). bypass_package=True lets
     # teachers/admins mark anyone present regardless of package state.
     newly_present = status == "present" and (att is None or att.status != "present")
     if newly_present and not bypass_package:
-        session = db.query(ClassSession).filter(ClassSession.id == session_id).first()
-        assert_can_book(db, student_id, session, count=1)
+        assert_can_book(db, student_id, session, count=1, is_makeup=bool(getattr(session, "is_makeup", False)))
 
     if att:
         att.status = status
         att.notes = notes
     else:
-        db.add(Attendance(session_id=session_id, student_id=student_id, status=status, notes=notes))
+        # A fresh row's makeup-ness comes from the booking's Enrollment
+        # override (set when the student rescheduled into this slot), not
+        # from occurrence-level is_makeup (which is per-occurrence, not
+        # per-student — see _consumption_count).
+        is_makeup = False
+        if occ_for_makeup is not None:
+            enr = db.query(Enrollment).filter(
+                Enrollment.occurrence_id == session_id, Enrollment.student_id == student_id,
+                Enrollment.kind == "include",
+            ).first()
+            is_makeup = bool(enr and enr.is_makeup)
+        db.add(Attendance(session_id=session_id, student_id=student_id, status=status, notes=notes,
+                          is_makeup=is_makeup))
     db.commit()
     return {"message": "Attendance updated"}
 
@@ -3636,6 +3717,11 @@ def student_cancel_session(
             session_id=session_id, student_id=student_id,
             status="student_cancelled", notes=reason or "Cancelled by student"
         ))
+    # Free the seat: remove the student from this occurrence's effective
+    # roster so capacity/available-slots and admin/teacher rosters update
+    # immediately, without touching the recurring baseline enrollment.
+    if occ.template_id:
+        _set_membership(db, occ, student_id, present=False, base_ids=_baseline_ids(db, occ.template_id))
     db.commit()
     return {"message": "Session cancelled", "session_id": session_id}
 
@@ -3860,22 +3946,93 @@ def _occurrence_roster_ids(db, occ, base_ids=None):
     return (base - exc) | inc
 
 
-def _set_membership(db, occ, student_id, present, base_ids):
+def _student_effective_occurrences_on_date(db, student_id, date, exclude_ids=()):
+    """A student's scheduled occurrences on one date, across every template
+    (baseline enrollment ∪ per-occurrence includes − excludes). Same logic as
+    get_student_sessions, scoped to a single date for conflict checks."""
+    base_tpls = [e.template_id for e in db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.occurrence_id.is_(None),
+        Enrollment.status == "active").all()]
+    overrides = db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.occurrence_id.isnot(None)).all()
+    excl_ids = {e.occurrence_id for e in overrides if e.kind == "exclude"}
+    incl_ids = {e.occurrence_id for e in overrides if e.kind == "include" and e.status == "active"}
+
+    base_occs = db.query(ClassOccurrence).filter(
+        ClassOccurrence.template_id.in_(base_tpls or [-1]),
+        ClassOccurrence.date == date,
+        ClassOccurrence.status == "scheduled",
+    ).all()
+    final_ids = ({o.id for o in base_occs} - excl_ids) | incl_ids
+    final_ids -= set(exclude_ids)
+    if not final_ids:
+        return []
+    # incl_ids spans the student's whole history, not just this date — the
+    # date filter here is load-bearing, not redundant with base_occs' filter.
+    return db.query(ClassOccurrence).filter(
+        ClassOccurrence.id.in_(final_ids), ClassOccurrence.date == date,
+        ClassOccurrence.status == "scheduled",
+    ).all()
+
+
+def _times_overlap(start1, end1, start2, end2):
+    return start1 < end2 and start2 < end1
+
+
+def _assert_no_conflict(db, student_id, target_occ, exclude_occurrence_id=None):
+    """Block booking `target_occ` if the student is already booked into it, or
+    into any other occurrence on the same date whose time overlaps it."""
+    exclude_ids = {target_occ.id}
+    if exclude_occurrence_id:
+        exclude_ids.add(exclude_occurrence_id)
+        if student_id in _occurrence_roster_ids(db, target_occ) and target_occ.id != exclude_occurrence_id:
+            raise HTTPException(status_code=400, detail="You are already booked into this class.")
+    elif student_id in _occurrence_roster_ids(db, target_occ):
+        raise HTTPException(status_code=400, detail="You are already booked into this class.")
+
+    others = _student_effective_occurrences_on_date(db, student_id, target_occ.date, exclude_ids=exclude_ids)
+    for o in others:
+        if _times_overlap(target_occ.start_time, target_occ.end_time, o.start_time, o.end_time):
+            name = o.template.name if o.template else "another class"
+            raise HTTPException(
+                status_code=400,
+                detail=f"You already have a class scheduled at this time ({name}, {o.start_time}-{o.end_time})."
+            )
+
+
+def _set_membership(db, occ, student_id, present, base_ids, is_makeup=False):
     """Make `student_id` present/absent on a single occurrence's roster via an
-    override row, against the template baseline."""
+    override row, against the template baseline.
+
+    `is_makeup` marks the include-override row as a makeup booking, so
+    _consumption_count can later charge it against the makeup quota instead of
+    the regular one once attendance is marked. If the student is already a
+    baseline member (no override row would normally be needed to add them), a
+    redundant include row is still created purely to carry that flag — it's a
+    no-op for roster membership math ((base − exc) ∪ inc is idempotent)."""
     in_base = student_id in base_ids
     row = db.query(Enrollment).filter(
         Enrollment.occurrence_id == occ.id, Enrollment.student_id == student_id).first()
     if present:
         if in_base:
-            if row:
-                db.delete(row)              # remove any exclude → baseline applies
+            if row and row.kind == "include":
+                row.is_makeup = is_makeup       # already an include row — just update the flag
+            else:
+                if row:
+                    db.delete(row)               # remove any exclude → baseline applies
+                if is_makeup:
+                    # Baseline already grants access; add a redundant include row
+                    # purely so the makeup flag has somewhere to live.
+                    db.add(Enrollment(template_id=occ.template_id, student_id=student_id,
+                                      occurrence_id=occ.id, kind="include", status="active",
+                                      is_makeup=True))
         else:
             if row:
-                row.kind = "include"; row.status = "active"
+                row.kind = "include"; row.status = "active"; row.is_makeup = is_makeup
             else:
                 db.add(Enrollment(template_id=occ.template_id, student_id=student_id,
-                                  occurrence_id=occ.id, kind="include", status="active"))
+                                  occurrence_id=occ.id, kind="include", status="active",
+                                  is_makeup=is_makeup))
     else:  # remove
         if in_base:
             if row:
@@ -4300,6 +4457,14 @@ async def enroll_in_template(template_id: int, request: Request, db: Session = D
     ).count()
     if t.capacity and active >= t.capacity:
         raise HTTPException(status_code=400, detail=f"Class is full ({active}/{t.capacity})")
+    # Check the template's already-materialized future occurrences for a
+    # time conflict with anything else the student is already booked into.
+    for occ in db.query(ClassOccurrence).filter(
+        ClassOccurrence.template_id == template_id,
+        ClassOccurrence.date >= _d.today().isoformat(),
+        ClassOccurrence.status == "scheduled",
+    ).all():
+        _assert_no_conflict(db, student_id, occ)
     if existing:
         existing.status = "active"
     else:
@@ -4335,6 +4500,7 @@ async def add_student_scoped(occ_id: int, request: Request, db: Session = Depend
             continue
         if cap and len(roster) >= cap:
             raise HTTPException(status_code=400, detail=f"Class on {occ.date} is full ({len(roster)}/{cap})")
+        _assert_no_conflict(db, student_id, occ)
         _set_membership(db, occ, student_id, present=True, base_ids=base)
         added += 1
     if added:
@@ -4441,16 +4607,25 @@ async def mark_occurrence_attendance(occ_id: int, student_id: int, request: Requ
     att = db.query(Attendance).filter(
         Attendance.session_id == occ_id, Attendance.student_id == student_id
     ).first()
+    # Makeup-ness: per-student (this booking's Enrollment override) OR the
+    # occurrence-level flag (a dedicated makeup-only occurrence) — a shared
+    # regular occurrence can be a makeup for one student and regular for others.
+    enr = db.query(Enrollment).filter(
+        Enrollment.occurrence_id == occ_id, Enrollment.student_id == student_id,
+        Enrollment.kind == "include",
+    ).first()
+    is_makeup = bool(o.is_makeup or (enr and enr.is_makeup))
     # Package gate: only when newly consuming a 'present' slot.
     # bypass_package=True lets teachers/admins mark any student present regardless of package.
     newly_present = status == "present" and (att is None or att.status != "present")
     if newly_present and not bypass_package:
-        assert_can_book(db, student_id, o, count=1, is_makeup=bool(o.is_makeup))
+        assert_can_book(db, student_id, o, count=1, is_makeup=is_makeup)
     if att:
         att.status = status
         att.notes = notes
     else:
-        db.add(Attendance(session_id=occ_id, student_id=student_id, status=status, notes=notes))
+        db.add(Attendance(session_id=occ_id, student_id=student_id, status=status, notes=notes,
+                          is_makeup=is_makeup))
     db.commit()
     # Non-blocking advisories for the admin UI (overdue invoice, low sessions…).
     return {"message": "Attendance recorded", "warnings": student_warnings(db, student_id)}
@@ -6598,6 +6773,9 @@ async def create_razorpay_order(request: Request, db: Session = Depends(get_db))
 @app.post("/student/payments/verify")
 async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db)):
     import hashlib, hmac, random, string
+    from datetime import datetime as _dt
+    start_time = _dt.now()
+    print(f"[payments/verify] start_time={start_time.isoformat()}")
     body = await request.json()
 
     razorpay_order_id = body.get("razorpay_order_id")
@@ -6718,6 +6896,9 @@ async def verify_razorpay_payment(request: Request, db: Session = Depends(get_db
     )
     db.add(new_sp)
     db.commit()
+
+    end_time = _dt.now()
+    print(f"[payments/verify] end_time={end_time.isoformat()} duration_ms={(end_time - start_time).total_seconds() * 1000:.1f}")
 
     return {
         "success": True,

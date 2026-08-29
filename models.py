@@ -298,6 +298,7 @@ class Attendance(Base):
     status = Column(String, default="present")  # present | absent | late
     notes = Column(Text, nullable=True)
     enrollment_type = Column(String, default="single_session")  # single_session | recurring
+    is_makeup = Column(Boolean, default=False)  # copied from the booking's Enrollment override when marked
     marked_at = Column(DateTime(timezone=True), server_default=func.now())
 
     session = relationship("ClassSession", back_populates="attendances")
@@ -636,6 +637,7 @@ class Enrollment(Base):
     status = Column(String, default="active")             # active | paused | cancelled
     start_date = Column(String, nullable=True)            # effective date — gates counted occurrences
     end_date = Column(String, nullable=True)
+    is_makeup = Column(Boolean, default=False)            # this booking consumes the makeup quota, not regular
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     template = relationship("ClassTemplate", back_populates="enrollments")
