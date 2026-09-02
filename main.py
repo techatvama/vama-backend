@@ -2375,7 +2375,7 @@ def _occ_session_shape(db, occ, stu_map=None, student_id=None):
         "enrollment_count": len(students), "enrolled_students": students,
         "batch": {"id": t.id if t else None, "name": t.name if t else None, "subject": subject,
                   "teacher_id": occ.teacher_id, "teacher": {"name": teacher.name} if teacher else None,
-                  "color_tag": _template_color(occ.template_id, occ.start_time), "capacity": t.capacity if t else None},
+                  "color_tag": _template_color(subject, occ.teacher_id), "capacity": t.capacity if t else None},
         "attendances": [{"id": a.id, "student_id": a.student_id, "status": a.status} for a in atts],
         "my_attendance": my_att,
     }
@@ -2461,7 +2461,7 @@ def _build_session_shapes_bulk(db, occs, student_id=None):
             "batch": {"id": t.id if t else None, "name": t.name if t else None, "subject": subject,
                       "teacher_id": occ.teacher_id,
                       "teacher": {"name": teacher.name} if teacher else None,
-                      "color_tag": _template_color(occ.template_id, occ.start_time),
+                      "color_tag": _template_color(subject, occ.teacher_id),
                       "capacity": t.capacity if t else None},
             "attendances": [{"id": a.id, "student_id": a.student_id, "status": a.status} for a in atts],
             "my_attendance": my_att,
@@ -3800,19 +3800,17 @@ from datetime import date as _d, timedelta as _td
 _EDIT_FIELDS = ("start_time", "end_time", "teacher_id", "room_id")
 
 
-def _template_color(template_id, start_time=None):
-    """Deterministic color per (template, start_time) pair.
-    Same class series at same time stays one color across days;
-    different time slots get distinct colors even on the same template."""
-    import colorsys
-    seed = (template_id or 0)
-    if start_time:
-        try:
-            parts = str(start_time).split(":")
-            minutes = int(parts[0]) * 60 + int(parts[1])
-            seed = seed * 1440 + minutes
-        except Exception:
-            pass
+def _template_color(subject, teacher_id):
+    """Deterministic color per (subject, teacher) pair, so every class card
+    for the same teacher teaching the same subject is the same color across
+    every template/day/time — not per-template, which made otherwise-identical
+    classes (e.g. the same teacher's Monday and Wednesday sections) render as
+    distinct, arbitrary colors."""
+    import colorsys, hashlib
+    # hashlib (not the builtin hash()) so the seed is stable across process
+    # restarts and workers — Python randomizes str hash() per-process by default.
+    key = f"{subject or ''}::{teacher_id or 0}".encode()
+    seed = int(hashlib.md5(key).hexdigest(), 16)
     hue = ((seed * 137.508) % 360) / 360.0
     r, g, b = colorsys.hls_to_rgb(hue, 0.45, 0.65)
     return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
@@ -4736,7 +4734,7 @@ def scheduling_calendar(
                 "teacher_id": o.teacher_id,
                 "teacher": {"name": teacher.name} if teacher else None,
                 "capacity": t.capacity if t else None,
-                "color_tag": _template_color(o.template_id, o.start_time),
+                "color_tag": _template_color(t.course, o.teacher_id),
             } if t else None,
         })
     return {"view": view, "count": len(result), "occurrences": result}
