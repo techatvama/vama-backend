@@ -2660,6 +2660,8 @@ def _student_reschedule(db, student_id, old_id, new_id, is_makeup=True):
     if old:
         _set_membership(db, old, student_id, present=False, base_ids=_baseline_ids(db, old.template_id))
     _set_membership(db, new, student_id, present=True, base_ids=base_new, is_makeup=is_makeup)
+    audit(db, "booking.rescheduled", subject=("student", student_id),
+          detail=_booking_audit_detail(db, student_id, new, old_occ=old, is_makeup=is_makeup))
     db.commit()
     return {"message": "Rescheduled"}
 
@@ -2832,6 +2834,15 @@ def get_teacher_students(teacher_id: int, db: Session = Depends(get_db)):
     # Primary teacher OR any multi-instrument assignment to this teacher.
     ids = {s.id for s in db.query(Student).filter(Student.teacher_id == teacher_id).all()}
     ids |= {ti.student_id for ti in db.query(StudentInstructor).filter(StudentInstructor.teacher_id == teacher_id).all()}
+    # Baseline roster membership from the Scheduler's class templates (class_enrollments).
+    template_ids = [t.id for t in db.query(ClassTemplate.id).filter(ClassTemplate.teacher_id == teacher_id).all()]
+    if template_ids:
+        ids |= {e.student_id for e in db.query(Enrollment).filter(
+            Enrollment.template_id.in_(template_ids),
+            Enrollment.occurrence_id.is_(None),
+            Enrollment.kind == "include",
+            Enrollment.status == "active",
+        ).all()}
     students = db.query(Student).filter(Student.id.in_(ids or [-1])).order_by(Student.first_name).all()
     return [
         {
@@ -3706,6 +3717,8 @@ def student_cancel_session(
     # immediately, without touching the recurring baseline enrollment.
     if occ.template_id:
         _set_membership(db, occ, student_id, present=False, base_ids=_baseline_ids(db, occ.template_id))
+    audit(db, "booking.cancelled", subject=("student", student_id),
+          detail=_booking_audit_detail(db, student_id, occ, reason=reason))
     db.commit()
     return {"message": "Session cancelled", "session_id": session_id}
 
@@ -3800,17 +3813,21 @@ from datetime import date as _d, timedelta as _td
 _EDIT_FIELDS = ("start_time", "end_time", "teacher_id", "room_id")
 
 
-def _template_color(subject, teacher_id):
-    """Deterministic color per (subject, teacher) pair, so every class card
-    for the same teacher teaching the same subject is the same color across
-    every template/day/time — not per-template, which made otherwise-identical
-    classes (e.g. the same teacher's Monday and Wednesday sections) render as
-    distinct, arbitrary colors."""
+def _template_color(subject, teacher_id=None):
+    """Color keyed purely on subject, so every class card for the same
+    subject is the same color everywhere — regardless of teacher, template,
+    day, or time — and every distinct subject gets a visually distinct color.
+    `teacher_id` is accepted (unused) so existing call sites don't need to
+    change. Known subjects use the curated _SUBJECT_COLORS palette (guaranteed
+    distinct, hand-picked); anything outside that catalog falls back to a
+    deterministic hash so new subjects still get a stable, reasonable color
+    without a code change."""
+    if subject and subject in _SUBJECT_COLORS:
+        return _SUBJECT_COLORS[subject]
     import colorsys, hashlib
     # hashlib (not the builtin hash()) so the seed is stable across process
     # restarts and workers — Python randomizes str hash() per-process by default.
-    key = f"{subject or ''}::{teacher_id or 0}".encode()
-    seed = int(hashlib.md5(key).hexdigest(), 16)
+    seed = int(hashlib.md5((subject or "").encode()).hexdigest(), 16)
     hue = ((seed * 137.508) % 360) / 360.0
     r, g, b = colorsys.hls_to_rgb(hue, 0.45, 0.65)
     return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
@@ -3911,6 +3928,29 @@ def _stream_occurrences(db, occ, scope):
         ClassOccurrence.template_id == occ.template_id, ClassOccurrence.date >= occ.date
     ).all()
     return [x for x in rows if (not weekly) or _d.fromisoformat(x.date).weekday() == target_wd]
+
+
+def _booking_audit_detail(db, student_id, occ, old_occ=None, **extra):
+    """Common shape for booking.* audit events — the admin dashboard's
+    "student activity" widget reads these back via /admin/audit-logs."""
+    s = db.query(Student).filter(Student.id == student_id).first()
+    t = occ.template if occ else None
+    detail = {
+        "student_id": student_id,
+        "student_name": f"{s.first_name} {s.last_name}" if s else None,
+        "occurrence_id": occ.id if occ else None,
+        "course": t.course if t else None,
+        "date": occ.date if occ else None,
+        "start_time": occ.start_time if occ else None,
+        "end_time": occ.end_time if occ else None,
+        "teacher_id": occ.teacher_id if occ else None,
+        "center_id": t.center_id if t else None,
+    }
+    if old_occ:
+        detail["old_date"] = old_occ.date
+        detail["old_start_time"] = old_occ.start_time
+    detail.update(extra)
+    return detail
 
 
 def _baseline_ids(db, template_id):
@@ -4114,6 +4154,21 @@ async def create_template(request: Request, db: Session = Depends(get_db),
     body = await request.json()
     _validate_times(body.get("start_time"), body.get("end_time"))
 
+    # Every field is required — the class shouldn't be created with any of
+    # them left blank (name/course/teacher_id/capacity/start_time/end_time).
+    name_in = (body.get("name") or body.get("title") or "").strip()
+    course_in = body.get("course") or body.get("subject")
+    missing = []
+    if not name_in: missing.append("name")
+    if not course_in: missing.append("course")
+    if not body.get("teacher_id"): missing.append("teacher_id")
+    if not body.get("start_time"): missing.append("start_time")
+    if not body.get("end_time"): missing.append("end_time")
+    capacity_in = body.get("capacity")
+    if capacity_in in (None, "") or int(capacity_in) <= 0: missing.append("capacity")
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required field(s): {', '.join(missing)}")
+
     # Accept recurrence fields either nested {"recurrence": {...}} or flat at top level.
     rec = body.get("recurrence") or {}
     if not rec.get("freq"):
@@ -4141,13 +4196,8 @@ async def create_template(request: Request, db: Session = Depends(get_db),
     if not center_id and caller and getattr(caller, "access_role", None) == "center_admin":
         center_id = getattr(caller, "center_id", None)
 
-    # Accept either "name" or "title" from the frontend.
-    name = body.get("name") or body.get("title") or ""
-    # Accept either "course" or "subject" from the frontend.
-    course = body.get("course") or body.get("subject")
-
     t = ClassTemplate(
-        name=name, course=course,
+        name=name_in, course=course_in,
         teacher_id=body.get("teacher_id"), center_id=center_id,
         room_id=body.get("room_id"),
         start_time=body["start_time"], end_time=body["end_time"],
@@ -4453,6 +4503,12 @@ async def enroll_in_template(template_id: int, request: Request, db: Session = D
         db.add(Enrollment(template_id=template_id, student_id=student_id,
                           status="active", start_date=body.get("start_date") or _d.today().isoformat()))
     _reactivate_student_if_needed(db, student_id)
+    next_occ = db.query(ClassOccurrence).filter(
+        ClassOccurrence.template_id == template_id, ClassOccurrence.status == "scheduled",
+        ClassOccurrence.date >= _d.today().isoformat(),
+    ).order_by(ClassOccurrence.date, ClassOccurrence.start_time).first()
+    audit(db, "booking.booked", subject=("student", student_id),
+          detail=_booking_audit_detail(db, student_id, next_occ, course=t.course, center_id=t.center_id))
     db.commit()
     return {"message": "Enrolled"}
 
@@ -4487,6 +4543,8 @@ async def add_student_scoped(occ_id: int, request: Request, db: Session = Depend
         added += 1
     if added:
         _reactivate_student_if_needed(db, student_id)
+        audit(db, "booking.booked", subject=("student", student_id),
+              detail=_booking_audit_detail(db, student_id, o, occurrences_affected=added, scope=scope))
     db.commit()
     return {"message": "Added", "occurrences_affected": added, "scope": scope}
 
@@ -5980,6 +6038,70 @@ def dashboard_alerts(center_id: Optional[int] = None, db: Session = Depends(get_
     }
 
 
+@app.get("/admin/dashboard/today-attendance")
+def dashboard_today_attendance(center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Today's classes and whether the teacher has marked attendance yet —
+    powers the admin dashboard's teacher-monitoring widget."""
+    from collections import defaultdict
+    today = str(_d.today())
+    q = db.query(ClassOccurrence).filter(
+        ClassOccurrence.date == today, ClassOccurrence.status == "scheduled",
+    )
+    occs = q.order_by(ClassOccurrence.start_time).all()
+    if center_id:
+        occs = [o for o in occs if o.template and o.template.center_id == center_id]
+
+    occ_ids = [o.id for o in occs] or [-1]
+    teacher_ids = {o.teacher_id for o in occs if o.teacher_id}
+    teacher_map = {t.id: t.name for t in db.query(Staff).filter(Staff.id.in_(teacher_ids or [-1])).all()}
+    marked_by_occ = defaultdict(int)
+    for a in db.query(Attendance).filter(
+        Attendance.session_id.in_(occ_ids), Attendance.status.in_(["present", "absent"])
+    ).all():
+        marked_by_occ[a.session_id] += 1
+
+    rows = []
+    for o in occs:
+        roster_size = len(_occurrence_roster_ids(db, o)) if o.template_id else 0
+        marked = marked_by_occ.get(o.id, 0)
+        rows.append({
+            "id": o.id, "course": o.template.course if o.template else None,
+            "name": o.template.name if o.template else None,
+            "teacher_id": o.teacher_id, "teacher_name": teacher_map.get(o.teacher_id),
+            "start_time": o.start_time, "end_time": o.end_time,
+            "roster_size": roster_size, "marked": marked,
+            "is_marked": roster_size > 0 and marked >= roster_size,
+        })
+
+    pending = sum(1 for r in rows if not r["is_marked"] and r["roster_size"] > 0)
+    return {"date": today, "total": len(rows), "pending": pending, "classes": rows}
+
+
+@app.get("/admin/dashboard/booking-activity")
+def dashboard_booking_activity(limit: int = 8, center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Recent student booking/reschedule/cancellation events — powers the
+    admin dashboard's student-activity monitoring widget."""
+    import json
+    q = db.query(AuditLog).filter(
+        AuditLog.action.in_(["booking.booked", "booking.rescheduled", "booking.cancelled"])
+    )
+    if center_id:
+        q = q.filter(AuditLog.center_id == center_id)
+    logs = q.order_by(AuditLog.created_at.desc()).limit(limit).all()
+
+    events = []
+    for log in logs:
+        try:
+            detail = json.loads(log.detail) if log.detail else {}
+        except (TypeError, ValueError):
+            detail = {}
+        events.append({
+            "id": log.id, "action": log.action, "created_at": log.created_at.isoformat() if log.created_at else None,
+            **detail,
+        })
+    return {"events": events}
+
+
 # ── Installment reminders (call from a daily scheduler/cron) ──
 
 _REMINDER_BUCKETS = {7, 3, 0, -1, -3, -7}  # days-until-due that trigger an email
@@ -6190,7 +6312,7 @@ def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Se
     from collections import defaultdict
 
     now = _dt.utcnow()
-    days_map = {"week": 7, "month": 30, "quarter": 90, "year": 365}
+    days_map = {"today": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
     span = days_map.get(period, 30)
     start_dt = now - _td(days=span)
     start_str = start_dt.strftime("%Y-%m-%d")
@@ -6275,6 +6397,10 @@ def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Se
 
     # ════════════════════ STUDENTS ════════════════════
     new_students = [s for s in students if in_period(s.created_at.strftime("%Y-%m-%d") if s.created_at else None)]
+
+    active_count = sum(1 for s in students if (s.enrollment_status or "active") == "active")
+    on_break_count = sum(1 for s in students if s.enrollment_status == "on_break")
+    dropped_count = sum(1 for s in students if s.enrollment_status == "dropped")
 
     # Enrollment trend by month
     enroll_by_month = defaultdict(int)
@@ -6383,6 +6509,9 @@ def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Se
             "total": len(students),
             "new_this_period": len(new_students),
             "exam_students": exam_students,
+            "active": active_count,
+            "on_break": on_break_count,
+            "dropped": dropped_count,
             "enrollment_trend": enrollment_trend,
             "by_grade": students_by_grade,
             "by_course": students_by_course,
@@ -7131,6 +7260,139 @@ async def update_staff_access(staff_id: int, request: Request, db: Session = Dep
     if "center_id" in body:   s.center_id   = body["center_id"] or None
     db.commit()
     return {"message": "Access updated", "access_role": s.access_role, "center_id": s.center_id}
+
+
+_WEEKDAY_LABELS = {"MO": "Mon", "TU": "Tue", "WE": "Wed", "TH": "Thu", "FR": "Fri", "SA": "Sat", "SU": "Sun"}
+
+
+@app.get("/admin/staff/{staff_id}/profile")
+def staff_profile(staff_id: int, db: Session = Depends(get_db),
+                 current = Depends(require_roles("super_admin", "center_admin"))):
+    """Teacher profile page: their classes (with real rosters, not just a
+    count), weekly schedule, and performance analytics. Built on the v2
+    scheduling model (ClassTemplate/ClassOccurrence) since that's what's
+    actually live — the legacy Batch table isn't used here."""
+    from collections import defaultdict
+    staff = db.query(Staff).filter(Staff.id == staff_id).first()
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    templates = db.query(ClassTemplate).filter(
+        ClassTemplate.teacher_id == staff_id, ClassTemplate.status == "active"
+    ).all()
+    template_ids = [t.id for t in templates]
+    rules = {r.template_id: r for r in db.query(RecurrenceRule).filter(
+        RecurrenceRule.template_id.in_(template_ids or [-1])).all()}
+
+    all_occs = db.query(ClassOccurrence).filter(
+        ClassOccurrence.teacher_id == staff_id
+    ).all()
+    occs_by_template = defaultdict(list)
+    for o in all_occs:
+        occs_by_template[o.template_id].append(o)
+
+    att_by_template = defaultdict(lambda: {"present": 0, "absent": 0})
+    if all_occs:
+        occ_ids = [o.id for o in all_occs]
+        occ_template = {o.id: o.template_id for o in all_occs}
+        for a in db.query(Attendance).filter(
+            Attendance.session_id.in_(occ_ids), Attendance.status.in_(["present", "absent"])
+        ).all():
+            tid = occ_template.get(a.session_id)
+            if tid:
+                att_by_template[tid][a.status] += 1
+
+    today = str(_d.today())
+    month_start = today[:7] + "-01"
+
+    student_cache = {}
+    def _student_dict(sid):
+        if sid not in student_cache:
+            s = db.query(Student).filter(Student.id == sid).first()
+            student_cache[sid] = {"id": sid, "first_name": s.first_name, "last_name": s.last_name} if s else None
+        return student_cache[sid]
+
+    batches = []
+    subject_breakdown = defaultdict(int)
+    total_capacity = 0
+    total_sessions_taught = 0
+    sessions_this_month = 0
+    for t in templates:
+        roster_ids = sorted(_baseline_ids(db, t.id))
+        enrolled_students = [d for sid in roster_ids if (d := _student_dict(sid))]
+        rule = rules.get(t.id)
+        days = [_WEEKDAY_LABELS[c] for c in (rule.by_weekday or "").split(",") if c in _WEEKDAY_LABELS] if rule else []
+        occs = occs_by_template.get(t.id, [])
+        past_occs = [o for o in occs if o.date <= today]
+        month_occs = [o for o in occs if o.date >= month_start]
+        att = att_by_template.get(t.id, {"present": 0, "absent": 0})
+        att_total = att["present"] + att["absent"]
+        cap = t.capacity or 0
+        occupancy_pct = round((len(enrolled_students) / cap) * 100) if cap else 0
+
+        subject_breakdown[t.course or "Unassigned"] += 1
+        total_capacity += cap
+        total_sessions_taught += len(past_occs)
+        sessions_this_month += len(month_occs)
+
+        batches.append({
+            "id": t.id, "subject": t.course, "name": t.name,
+            "start_time": t.start_time, "end_time": t.end_time,
+            "capacity": cap, "enrolled": len(enrolled_students),
+            "occupancy_pct": occupancy_pct,
+            "color_tag": _template_color(t.course, staff_id),
+            "days_of_week": days,
+            "total_sessions": len(occs),
+            "avg_attendance_rate": round((att["present"] / att_total) * 100) if att_total else 0,
+            "enrolled_students": enrolled_students,
+        })
+
+    # Active students: same dedup logic as GET /teacher/{id}/students, so the
+    # count here always matches that page.
+    active_ids = {s.id for s in db.query(Student).filter(Student.teacher_id == staff_id).all()}
+    active_ids |= {ti.student_id for ti in db.query(StudentInstructor).filter(StudentInstructor.teacher_id == staff_id).all()}
+    if template_ids:
+        active_ids |= {e.student_id for e in db.query(Enrollment).filter(
+            Enrollment.template_id.in_(template_ids), Enrollment.occurrence_id.is_(None),
+            Enrollment.kind == "include", Enrollment.status == "active",
+        ).all()}
+
+    total_present = sum(a["present"] for a in att_by_template.values())
+    total_marked = sum(a["present"] + a["absent"] for a in att_by_template.values())
+
+    future_occs = sorted(
+        [o for o in all_occs if o.date >= today and o.status == "scheduled"],
+        key=lambda o: (o.date, o.start_time)
+    )[:10]
+    tpl_map = {t.id: t for t in templates}
+    upcoming_sessions = []
+    for o in future_occs:
+        t = tpl_map.get(o.template_id)
+        cap = t.capacity if t else 0
+        enrolled = len(_baseline_ids(db, o.template_id)) if o.template_id else 0
+        upcoming_sessions.append({
+            "id": o.id, "subject": t.course if t else None, "batch_name": t.name if t else None,
+            "start_time": o.start_time, "end_time": o.end_time, "date": o.date,
+            "enrolled": enrolled, "capacity": cap,
+            "color_tag": _template_color(t.course if t else None, staff_id),
+        })
+
+    return {
+        "name": staff.name, "role": staff.role, "email": staff.email,
+        "phone": staff.phone, "joined_date": staff.created_at.isoformat() if staff.created_at else None,
+        "analytics": {
+            "active_students": len(active_ids),
+            "total_capacity": total_capacity,
+            "occupancy_pct": round((len(active_ids) / total_capacity) * 100) if total_capacity else 0,
+            "total_batches": len(templates),
+            "total_sessions_taught": total_sessions_taught,
+            "sessions_this_month": sessions_this_month,
+            "overall_attendance_rate": round((total_present / total_marked) * 100) if total_marked else 0,
+            "subject_breakdown": dict(subject_breakdown),
+        },
+        "batches": batches,
+        "upcoming_sessions": upcoming_sessions,
+    }
 
 
 @app.put("/admin/students/{student_id}/center")
