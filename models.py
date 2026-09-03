@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, Boolean, DateTime, Float,
+    Column, Integer, String, Boolean, DateTime, Date, Float,
     ForeignKey, Text, UniqueConstraint, Index
 )
 from sqlalchemy.orm import relationship
@@ -155,6 +155,7 @@ class ExamSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     exam_board = Column(String, nullable=False)
+    exam_date = Column(Date, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -699,6 +700,9 @@ class LearningEnrollment(Base):
     status = Column(String, nullable=False, default="active")  # active | paused | completed
     start_date = Column(String, nullable=True)
     end_date = Column(String, nullable=True)
+    is_exam_student = Column(Boolean, default=False)
+    exam_date = Column(String, nullable=True)  # mirrored from exam_session's date — not user-typed
+    exam_session_id = Column(Integer, ForeignKey("exam_sessions.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

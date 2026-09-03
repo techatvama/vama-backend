@@ -34,7 +34,7 @@ from models import (
     Package, StudentPackage, Invoice, Subscription, AppSetting,
     AuditLog,
     Room, Holiday, ClassTemplate, RecurrenceRule, ClassOccurrence,
-    Enrollment, StudentInstructor,
+    Enrollment, StudentInstructor, TeacherAssignment,
     InvoiceItem, InvoiceInstallment, InvoicePayment, PaymentMode, InvoiceTemplate,
     StudentApplication, LearningEnrollment, CenterFormConfig, AuthToken
 )
@@ -239,6 +239,12 @@ def _run_migrations():
         # ── Per-student makeup tracking (roster override + attendance record) ──
         "ALTER TABLE class_enrollments ADD COLUMN IF NOT EXISTS is_makeup BOOLEAN DEFAULT FALSE",
         "ALTER TABLE attendances ADD COLUMN IF NOT EXISTS is_makeup BOOLEAN DEFAULT FALSE",
+        # ── Per-instrument exam status (was a single student-wide flag) ──
+        "ALTER TABLE learning_enrollments ADD COLUMN IF NOT EXISTS is_exam_student BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE learning_enrollments ADD COLUMN IF NOT EXISTS exam_date VARCHAR",
+        # ── Exam session picked from Curriculum → Exam Sessions, not typed ──
+        "ALTER TABLE exam_sessions ADD COLUMN IF NOT EXISTS exam_date DATE",
+        "ALTER TABLE learning_enrollments ADD COLUMN IF NOT EXISTS exam_session_id INTEGER REFERENCES exam_sessions(id)",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -715,9 +721,11 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
         enroll_map[(le.student_id, le.subject)] = le
     pkg_map = {p.id: p.name for p in db.query(Package).all()}
 
+    exam_session_map = {es.id: es for es in db.query(ExamSession).all()}
     tracks_by_student = {}
     for ti in db.query(StudentInstructor).all():
         le = enroll_map.get((ti.student_id, ti.instrument or ""))
+        exam_session = exam_session_map.get(le.exam_session_id) if le and le.exam_session_id else None
         tracks_by_student.setdefault(ti.student_id, []).append({
             "id": ti.id,
             "teacher_id": ti.teacher_id,
@@ -729,6 +737,10 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
             "status": le.status if le else "active",
             "fee_package_id": le.fee_package_id if le else None,
             "fee_package_name": pkg_map.get(le.fee_package_id) if le else None,
+            "is_exam_student": bool(le.is_exam_student) if le else False,
+            "exam_session_id": le.exam_session_id if le else None,
+            "exam_session_name": exam_session.name if exam_session else None,
+            "exam_date": le.exam_date if le else None,
         })
     # Build learning_enrollments map per student for the enrollment module
     enrollments_by_student = {}
@@ -788,13 +800,29 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
 
 def _sync_student_primary(db, student):
     """Mirror the first track onto Student.instrument/teacher_id for the portal
-    and progress views (which remain single-track aware)."""
+    and progress views (which remain single-track aware). Also mirrors exam
+    status: Student.is_exam_student is True if ANY of the student's active
+    LearningEnrollments is an exam track, with exam_date set to the soonest
+    such date — the per-instrument truth lives on LearningEnrollment, this is
+    just a backward-compat rollup for callers not yet instrument-aware."""
     first = (db.query(StudentInstructor)
              .filter(StudentInstructor.student_id == student.id)
              .order_by(StudentInstructor.id).first())
     student.teacher_id = first.teacher_id if first else None
     if first and first.instrument:
         student.instrument = first.instrument
+
+    # Session autoflush is off (database.py) — flush so this query sees any
+    # pending LearningEnrollment.is_exam_student change from this request.
+    db.flush()
+    exam_enrollments = (db.query(LearningEnrollment)
+                         .filter(LearningEnrollment.student_id == student.id,
+                                 LearningEnrollment.status == "active",
+                                 LearningEnrollment.is_exam_student == True)
+                         .all())
+    student.is_exam_student = bool(exam_enrollments)
+    dates = sorted(e.exam_date for e in exam_enrollments if e.exam_date)
+    student.exam_date = dates[0] if dates else None
 
 
 def _instructor_track_dict(ti: StudentInstructor, db) -> dict:
@@ -805,6 +833,8 @@ def _instructor_track_dict(ti: StudentInstructor, db) -> dict:
         LearningEnrollment.subject == (ti.instrument or ""),
     ).first()
     pkg = db.query(Package).filter(Package.id == enroll.fee_package_id).first() if enroll and enroll.fee_package_id else None
+    exam_session = (db.query(ExamSession).filter(ExamSession.id == enroll.exam_session_id).first()
+                     if enroll and enroll.exam_session_id else None)
     return {
         "id": ti.id,
         "teacher_id": ti.teacher_id,
@@ -819,6 +849,10 @@ def _instructor_track_dict(ti: StudentInstructor, db) -> dict:
         "fee_package_id": enroll.fee_package_id if enroll else None,
         "fee_package_name": pkg.name if pkg else None,
         "fee_package_price": pkg.price if pkg else None,
+        "is_exam_student": bool(enroll.is_exam_student) if enroll else False,
+        "exam_session_id": enroll.exam_session_id if enroll else None,
+        "exam_session_name": exam_session.name if exam_session else None,
+        "exam_date": enroll.exam_date if enroll else None,
     }
 
 
@@ -842,6 +876,10 @@ async def add_student_instructor(student_id: int, request: Request, db: Session 
     instrument = (body.get("instrument") or "").strip() or None
     grade = body.get("grade", "Debut")
     syllabus_type = body.get("syllabus_type", "Trinity")
+    is_exam_student = bool(body.get("is_exam_student", False))
+    exam_session_id = body.get("exam_session_id") or None
+    exam_session = db.query(ExamSession).filter(ExamSession.id == exam_session_id).first() if exam_session_id else None
+    exam_date = exam_session.exam_date.isoformat() if (exam_session and exam_session.exam_date) else None
 
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
@@ -875,6 +913,9 @@ async def add_student_instructor(student_id: int, request: Request, db: Session 
         enroll.grade = grade
         enroll.syllabus_type = syllabus_type
         enroll.status = "active"
+        enroll.is_exam_student = is_exam_student
+        enroll.exam_session_id = exam_session_id
+        enroll.exam_date = exam_date
         if fee_package_id:
             enroll.fee_package_id = fee_package_id
     else:
@@ -888,6 +929,9 @@ async def add_student_instructor(student_id: int, request: Request, db: Session 
             center_id=student.center_id,
             status="active",
             start_date=body.get("start_date") or str(__import__("datetime").date.today()),
+            is_exam_student=is_exam_student,
+            exam_session_id=exam_session_id,
+            exam_date=exam_date,
         )
         db.add(enroll)
 
@@ -926,12 +970,23 @@ async def update_student_instructor(student_id: int, track_id: int, request: Req
 
     grade = body.get("grade", enroll.grade if enroll else "Debut")
     syllabus_type = body.get("syllabus_type", enroll.syllabus_type if enroll else "Trinity")
+    is_exam_student = body.get("is_exam_student", enroll.is_exam_student if enroll else False)
     fee_package_id = body.get("fee_package_id") or _enrollment_module._auto_package(db, subject, grade)
+
+    if "exam_session_id" in body:
+        exam_session_id = body["exam_session_id"] or None
+    else:
+        exam_session_id = enroll.exam_session_id if enroll else None
+    exam_session = db.query(ExamSession).filter(ExamSession.id == exam_session_id).first() if exam_session_id else None
+    exam_date = exam_session.exam_date.isoformat() if (exam_session and exam_session.exam_date) else None
 
     if enroll:
         enroll.teacher_id = ti.teacher_id
         enroll.grade = grade
         enroll.syllabus_type = syllabus_type
+        enroll.is_exam_student = bool(is_exam_student)
+        enroll.exam_session_id = exam_session_id
+        enroll.exam_date = exam_date
         if fee_package_id:
             enroll.fee_package_id = fee_package_id
         if "status" in body:
@@ -947,6 +1002,9 @@ async def update_student_instructor(student_id: int, track_id: int, request: Req
             fee_package_id=fee_package_id,
             center_id=student.center_id if student else None,
             status="active",
+            is_exam_student=bool(is_exam_student),
+            exam_session_id=exam_session_id,
+            exam_date=exam_date,
         )
         db.add(enroll)
 
@@ -2983,13 +3041,67 @@ def get_subjects(db: Session = Depends(get_db)):
     return [{"id": s.id, "name": s.name, "is_active": s.is_active} for s in subjects]
 
 
+def _exam_session_dict(e: "ExamSession") -> dict:
+    return {
+        "id": e.id, "name": e.name, "exam_board": e.exam_board,
+        "exam_date": e.exam_date.isoformat() if e.exam_date else None,
+        "is_active": e.is_active,
+    }
+
+
 @app.get("/admin/exam-sessions")
 def get_exam_sessions(db: Session = Depends(get_db)):
-    sessions = db.query(ExamSession).all()
-    return [
-        {"id": e.id, "name": e.name, "exam_board": e.exam_board, "is_active": e.is_active}
-        for e in sessions
-    ]
+    sessions = db.query(ExamSession).order_by(ExamSession.exam_date.is_(None), ExamSession.exam_date).all()
+    return [_exam_session_dict(e) for e in sessions]
+
+
+@app.post("/admin/exam-sessions")
+async def create_exam_session(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    if not body.get("name") or not body.get("exam_board"):
+        raise HTTPException(status_code=400, detail="name and exam_board are required")
+    session = ExamSession(
+        name=body["name"],
+        exam_board=body["exam_board"],
+        exam_date=body.get("exam_date") or None,
+        is_active=body.get("is_active", True),
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return _exam_session_dict(session)
+
+
+@app.put("/admin/exam-sessions/{session_id}")
+async def update_exam_session(session_id: int, request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    if "name" in body:
+        session.name = body["name"]
+    if "exam_board" in body:
+        session.exam_board = body["exam_board"]
+    if "exam_date" in body:
+        session.exam_date = body["exam_date"] or None
+    if "is_active" in body:
+        session.is_active = body["is_active"]
+    db.commit()
+    db.refresh(session)
+    return _exam_session_dict(session)
+
+
+@app.delete("/admin/exam-sessions/{session_id}")
+def delete_exam_session(session_id: int, db: Session = Depends(get_db)):
+    session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+    db.query(LearningEnrollment).filter(LearningEnrollment.exam_session_id == session_id).update(
+        {"exam_session_id": None}, synchronize_session=False
+    )
+    db.delete(session)
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/admin/dashboard/stats")
@@ -4398,15 +4510,15 @@ async def cancel_occurrence(occ_id: int, request: Request, db: Session = Depends
 
 @app.delete("/scheduling/occurrences/{occ_id}")
 def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(get_db)):
-    """Permanently delete occurrence(s), isolated to the selected recurrence
-    STREAM (same weekday/time). scope:
+    """Permanently delete occurrence(s). scope:
        this            → just this occurrence (+ its attendance)
-       this_and_future → this + all later occurrences in the SAME stream; the
-                         stream stops generating forward (other weekdays untouched)
-       series          → all occurrences in the SAME stream; other streams (and
-                         their enrollments) are preserved."""
-    if scope not in ("this", "this_and_future", "series"):
-        raise HTTPException(status_code=400, detail="scope must be this|this_and_future|series")
+       this_and_future → this + all later occurrences in the SAME weekday stream;
+                         that stream stops generating forward (other weekdays untouched)
+    (No "entire series" option — deleting a class's full history, including
+    past attendance, was judged too destructive for a delete action; use
+    this_and_future plus letting past occurrences age out instead.)"""
+    if scope not in ("this", "this_and_future"):
+        raise HTTPException(status_code=400, detail="scope must be this|this_and_future")
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
@@ -4426,6 +4538,12 @@ def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(ge
     def _purge(rows):
         ids = [x.id for x in rows]
         if ids:
+            # Enrollment (per-occurrence add/remove overrides) and TeacherAssignment
+            # both FK to class_occurrences.id with no cascade — deleting the
+            # occurrence first raises an unhandled IntegrityError (surfaces to the
+            # UI as a bare "Failed" with no detail) whenever either exists.
+            db.query(Enrollment).filter(Enrollment.occurrence_id.in_(ids)).delete(synchronize_session=False)
+            db.query(TeacherAssignment).filter(TeacherAssignment.occurrence_id.in_(ids)).delete(synchronize_session=False)
             db.query(Attendance).filter(Attendance.session_id.in_(ids)).delete(synchronize_session=False)
             db.query(ClassOccurrence).filter(ClassOccurrence.id.in_(ids)).delete(synchronize_session=False)
         return len(ids)
@@ -4436,7 +4554,7 @@ def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(ge
     if scope == "this":
         n = _purge([o])
 
-    elif scope == "this_and_future":
+    else:  # this_and_future
         n = _purge([x for x in base.filter(ClassOccurrence.date >= o.date).all() if _same_stream(x)])
         # Stop this stream from regenerating; leave other streams intact.
         if rule:
@@ -4450,18 +4568,6 @@ def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(ge
                         x.is_modified = True
             else:
                 rule.end_date = (_d.fromisoformat(o.date) - _td(days=1)).isoformat()
-
-    else:  # series — delete the whole stream (past + future)
-        n = _purge([x for x in base.all() if _same_stream(x)])
-        if multi_stream:
-            # Drop just this weekday; other streams + enrollments survive.
-            rule.by_weekday = ",".join(w for w in weekdays if w != target_code)
-        elif o.template_id:
-            # Single-stream template → remove it entirely.
-            tid = o.template_id
-            db.query(Enrollment).filter(Enrollment.template_id == tid).delete(synchronize_session=False)
-            db.query(RecurrenceRule).filter(RecurrenceRule.template_id == tid).delete(synchronize_session=False)
-            db.query(ClassTemplate).filter(ClassTemplate.id == tid).delete(synchronize_session=False)
     db.commit()
     return {"message": "Deleted", "count": n}
 
@@ -6398,7 +6504,29 @@ def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Se
     # ════════════════════ STUDENTS ════════════════════
     new_students = [s for s in students if in_period(s.created_at.strftime("%Y-%m-%d") if s.created_at else None)]
 
-    active_count = sum(1 for s in students if (s.enrollment_status or "active") == "active")
+    # "Active" here means "currently has an active package" (not expired, not
+    # exhausted) — reuses the same resolve_package_state logic that gates the
+    # student portal, so this matches what /student/{id}/package-status would
+    # say for each student, rather than just trusting the enrollment_status
+    # field (which a student's package can silently drift out of sync with —
+    # e.g. still flagged "active" after their package has expired).
+    # Batched (not one query per student — that took 20s+ over 250 students):
+    # one query for every status='active' StudentPackage row at this center,
+    # reduced to each student's most recent, then resolve_package_state is
+    # only called for that (usually much smaller) set.
+    active_sp_rows = (
+        db.query(StudentPackage)
+        .filter(StudentPackage.student_id.in_(student_ids or [-1]), StudentPackage.status == "active")
+        .order_by(StudentPackage.student_id, StudentPackage.created_at.desc())
+        .all()
+    )
+    latest_active_sp = {}
+    for sp in active_sp_rows:
+        latest_active_sp.setdefault(sp.student_id, sp)  # first hit per student = most recent (order_by above)
+    active_count = sum(
+        1 for sp in latest_active_sp.values()
+        if resolve_package_state(db, sp)["effective_status"] == "active"
+    )
     on_break_count = sum(1 for s in students if s.enrollment_status == "on_break")
     dropped_count = sum(1 for s in students if s.enrollment_status == "dropped")
 
