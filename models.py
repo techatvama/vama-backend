@@ -136,7 +136,13 @@ class Grade(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False, unique=True)
+    # `level` is the original NOT NULL ordering column; `display_order` was
+    # added later for the same purpose but never backfilled from it. Both are
+    # kept in sync on every write so neither ordering path (this admin API vs.
+    # the grade-progression logic elsewhere) can drift out of step again.
+    level = Column(Integer, nullable=False, default=0)
     display_order = Column(Integer, default=0)
+    description = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -145,6 +151,7 @@ class Subject(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

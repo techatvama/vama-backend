@@ -245,6 +245,10 @@ def _run_migrations():
         # ── Exam session picked from Curriculum → Exam Sessions, not typed ──
         "ALTER TABLE exam_sessions ADD COLUMN IF NOT EXISTS exam_date DATE",
         "ALTER TABLE learning_enrollments ADD COLUMN IF NOT EXISTS exam_session_id INTEGER REFERENCES exam_sessions(id)",
+        # ── Subject Manager: description field + full CRUD (was read-only) ──
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS description TEXT",
+        # ── Grade Manager: description field + full CRUD (was read-only) ──
+        "ALTER TABLE grades ADD COLUMN IF NOT EXISTS description TEXT",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -1392,13 +1396,12 @@ DEFAULT_FORM_FIELDS = [
     {"key": "address", "label": "Address", "type": "textarea", "required": False, "enabled": True, "system": False, "order": 10},
     {"key": "city", "label": "City", "type": "text", "required": False, "enabled": True, "system": False, "order": 11},
     {"key": "state", "label": "State / Region", "type": "text", "required": False, "enabled": True, "system": False, "order": 12},
-    {"key": "desired_course", "label": "Desired Course", "type": "select_subjects", "required": True, "enabled": True, "system": True, "order": 13},
+    {"key": "desired_course", "label": "Desired Course", "type": "select_subjects", "required": True, "enabled": True, "system": False, "order": 13},
     {"key": "class_frequency", "label": "Class Frequency", "type": "select", "required": False, "enabled": True, "system": False, "order": 14, "options": ["Weekly", "Bi-Weekly", "Monthly"]},
-    {"key": "nearest_vama_center", "label": "Nearest Center", "type": "select_centers", "required": True, "enabled": True, "system": True, "order": 15},
-    {"key": "blood_group", "label": "Blood Group", "type": "select", "required": False, "enabled": True, "system": False, "order": 16, "options": ["A+","A-","B+","B-","AB+","AB-","O+","O-"]},
-    {"key": "allergies", "label": "Allergies", "type": "text", "required": False, "enabled": True, "system": False, "order": 17},
-    {"key": "referrer", "label": "How did you hear about us?", "type": "select", "required": False, "enabled": True, "system": False, "order": 18, "options": ["Social Media", "Google Search", "Advertisement", "Referral", "Event", "Returning Student", "Other"]},
-    {"key": "notes", "label": "Additional Notes", "type": "textarea", "required": False, "enabled": True, "system": False, "order": 19},
+    {"key": "blood_group", "label": "Blood Group", "type": "select", "required": False, "enabled": True, "system": False, "order": 15, "options": ["A+","A-","B+","B-","AB+","AB-","O+","O-"]},
+    {"key": "allergies", "label": "Allergies", "type": "text", "required": False, "enabled": True, "system": False, "order": 16},
+    {"key": "referrer", "label": "How did you hear about us?", "type": "select", "required": False, "enabled": True, "system": False, "order": 17, "options": ["Social Media", "Google Search", "Advertisement", "Referral", "Event", "Returning Student", "Other"]},
+    {"key": "notes", "label": "Additional Notes", "type": "textarea", "required": False, "enabled": True, "system": False, "order": 18},
 ]
 
 
@@ -1434,8 +1437,13 @@ def get_admin_form_config(center_id: Optional[int] = None, db: Session = Depends
                           current=Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Return form config for current admin's center (or global if super_admin)."""
     caller = current.get("obj")
+    is_super_admin = "super_admin" in current.get("roles", [])
     cid = center_id
-    if not cid and caller and getattr(caller, "center_id", None):
+    if not is_super_admin:
+        # center_admin/staff are locked to their own center — a client-supplied
+        # center_id must never let them read another center's form.
+        cid = getattr(caller, "center_id", None)
+    elif not cid and caller and getattr(caller, "center_id", None):
         cid = caller.center_id
     return _get_form_config_for_center(cid, db)
 
@@ -1450,8 +1458,12 @@ async def save_admin_form_config(request: Request, center_id: Optional[int] = No
     fields = body if isinstance(body, list) else body.get("fields", DEFAULT_FORM_FIELDS)
 
     caller = current.get("obj")
+    is_super_admin = "super_admin" in current.get("roles", [])
     cid = center_id
-    if not cid and caller and getattr(caller, "center_id", None):
+    if not is_super_admin:
+        # center_admin/staff can only ever save their own center's form.
+        cid = getattr(caller, "center_id", None)
+    elif not cid and caller and getattr(caller, "center_id", None):
         cid = caller.center_id
 
     row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id == cid).first()
@@ -2096,17 +2108,20 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
 
 def _build_progress_response(student: Student, db: Session):
     """Build the full progress response for a student."""
-    # Find the syllabus matching student's grade + syllabus_type
+    # Match the syllabus by subject + grade — the same combination the
+    # Syllabus Builder treats as a unique identity when creating one. Matching
+    # on syllabus_type as well used to be the primary path, but the builder
+    # never sets that field (it's always NULL), while students default to
+    # 'Trinity' — so that comparison never matched anything, and every
+    # lookup silently fell back to "any syllabus for this subject" with no
+    # grade filter at all. That's harmless while each subject only has one
+    # grade's worth of content, but it means a Grade 1 and a Grade 5 student
+    # taking the same instrument would be shown the exact same syllabus the
+    # moment a second grade level exists for that subject.
     syllabus = db.query(Syllabus).filter(
+        Syllabus.subject == (student.instrument or student.desired_course),
         Syllabus.grade_name == student.current_grade,
-        Syllabus.syllabus_type == student.syllabus_type
     ).first()
-
-    # Fall back to any syllabus for their instrument/course
-    if not syllabus:
-        syllabus = db.query(Syllabus).filter(
-            Syllabus.subject == (student.instrument or student.desired_course)
-        ).first()
 
     student_data = {
         "id": student.id,
@@ -3029,16 +3044,125 @@ async def upload_material(request: Request, db: Session = Depends(get_db)):
 
 # ==================== Admin / Metadata ====================
 
+def _grade_dict(g: "Grade") -> dict:
+    return {"id": g.id, "name": g.name, "level": g.display_order, "description": g.description}
+
+
 @app.get("/admin/grades")
 def get_grades(db: Session = Depends(get_db)):
     grades = db.query(Grade).order_by(Grade.display_order).all()
-    return [{"id": g.id, "name": g.name, "level": g.display_order} for g in grades]
+    return [_grade_dict(g) for g in grades]
+
+
+@app.post("/admin/grades")
+async def create_grade(request: Request, db: Session = Depends(get_db)):
+    from sqlalchemy.exc import IntegrityError
+    body = await request.json()
+    if not body.get("name"):
+        raise HTTPException(status_code=400, detail="name is required")
+    grade = Grade(
+        name=body["name"],
+        level=body.get("level", 0),
+        display_order=body.get("level", 0),
+        description=body.get("description") or None,
+    )
+    db.add(grade)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A grade with this name already exists")
+    db.refresh(grade)
+    return _grade_dict(grade)
+
+
+@app.put("/admin/grades/{grade_id}")
+async def update_grade(grade_id: int, request: Request, db: Session = Depends(get_db)):
+    from sqlalchemy.exc import IntegrityError
+    body = await request.json()
+    grade = db.query(Grade).filter(Grade.id == grade_id).first()
+    if not grade:
+        raise HTTPException(status_code=404, detail="Grade not found")
+    if "name" in body:
+        grade.name = body["name"]
+    if "level" in body:
+        grade.level = body["level"]
+        grade.display_order = body["level"]
+    if "description" in body:
+        grade.description = body["description"] or None
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A grade with this name already exists")
+    db.refresh(grade)
+    return _grade_dict(grade)
+
+
+@app.delete("/admin/grades/{grade_id}")
+def delete_grade(grade_id: int, db: Session = Depends(get_db)):
+    grade = db.query(Grade).filter(Grade.id == grade_id).first()
+    if not grade:
+        raise HTTPException(status_code=404, detail="Grade not found")
+    db.delete(grade)
+    db.commit()
+    return {"success": True}
+
+
+def _subject_dict(s: "Subject") -> dict:
+    return {"id": s.id, "name": s.name, "description": s.description, "is_active": s.is_active}
 
 
 @app.get("/admin/subjects")
-def get_subjects(db: Session = Depends(get_db)):
-    subjects = db.query(Subject).filter(Subject.is_active == True).all()
-    return [{"id": s.id, "name": s.name, "is_active": s.is_active} for s in subjects]
+def get_subjects(include_inactive: bool = False, db: Session = Depends(get_db)):
+    query = db.query(Subject)
+    if not include_inactive:
+        query = query.filter(Subject.is_active == True)
+    subjects = query.order_by(Subject.name).all()
+    return [_subject_dict(s) for s in subjects]
+
+
+@app.post("/admin/subjects")
+async def create_subject(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    if not body.get("name"):
+        raise HTTPException(status_code=400, detail="name is required")
+    subject = Subject(
+        name=body["name"],
+        description=body.get("description") or None,
+        is_active=body.get("is_active", True),
+    )
+    db.add(subject)
+    db.commit()
+    db.refresh(subject)
+    return _subject_dict(subject)
+
+
+@app.put("/admin/subjects/{subject_id}")
+async def update_subject(subject_id: int, request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    if "name" in body:
+        subject.name = body["name"]
+    if "description" in body:
+        subject.description = body["description"] or None
+    if "is_active" in body:
+        subject.is_active = body["is_active"]
+    db.commit()
+    db.refresh(subject)
+    return _subject_dict(subject)
+
+
+@app.delete("/admin/subjects/{subject_id}")
+def delete_subject(subject_id: int, db: Session = Depends(get_db)):
+    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    db.delete(subject)
+    db.commit()
+    return {"success": True}
 
 
 def _exam_session_dict(e: "ExamSession") -> dict:
@@ -3168,6 +3292,7 @@ def list_syllabi(
         grade = db.query(Grade).filter(Grade.id == grade_id).first()
         if grade:
             q = q.filter(Syllabus.grade_name == grade.name)
+    q = q.order_by(Syllabus.id)
     return [
         {"id": s.id, "name": s.name, "subject": s.subject,
          "grade_name": s.grade_name, "syllabus_type": s.syllabus_type}
@@ -3197,6 +3322,23 @@ async def create_syllabus(request: Request, db: Session = Depends(get_db)):
         grade = db.query(Grade).filter(Grade.id == body["grade_id"]).first()
         if grade:
             grade_name = grade.name
+
+    if not subject_name or not grade_name:
+        raise HTTPException(status_code=400, detail="A valid subject and grade are required")
+
+    # Idempotent: a subject+grade combination should have exactly one syllabus.
+    # Returning the existing one (instead of creating another) is what stops
+    # duplicates from piling up when the builder's "Create Syllabus" button
+    # gets clicked more than once for the same combination.
+    if subject_name and grade_name:
+        existing = (
+            db.query(Syllabus)
+            .filter(Syllabus.subject == subject_name, Syllabus.grade_name == grade_name)
+            .order_by(Syllabus.id)
+            .first()
+        )
+        if existing:
+            return _syllabus_full(existing)
 
     syllabus = Syllabus(
         name=body.get("name", f"{subject_name} - {grade_name} Syllabus"),
@@ -3231,9 +3373,20 @@ async def create_syllabus(request: Request, db: Session = Depends(get_db)):
 
 @app.delete("/admin/syllabi/{syllabus_id}")
 def delete_syllabus(syllabus_id: int, db: Session = Depends(get_db)):
+    from models import StudentProgress as _SP
     s = db.query(Syllabus).filter(Syllabus.id == syllabus_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Syllabus not found")
+    # Query bare ids (not ORM objects) so the relationship walk above never
+    # pulls rows into the session's identity map — mixing that with the raw
+    # bulk .delete() calls below raises a spurious StaleDataError otherwise.
+    module_ids = [r[0] for r in db.query(SyllabusModule.id).filter(SyllabusModule.syllabus_id == syllabus_id).all()]
+    if module_ids:
+        content_ids = [r[0] for r in db.query(SyllabusContent.id).filter(SyllabusContent.module_id.in_(module_ids)).all()]
+        if content_ids:
+            db.query(_SP).filter(_SP.content_id.in_(content_ids)).delete(synchronize_session=False)
+            db.query(SyllabusContent).filter(SyllabusContent.module_id.in_(module_ids)).delete(synchronize_session=False)
+        db.query(SyllabusModule).filter(SyllabusModule.id.in_(module_ids)).delete(synchronize_session=False)
     db.delete(s)
     db.commit()
     return {"message": "Syllabus deleted"}
@@ -3278,9 +3431,14 @@ async def update_module(module_id: int, request: Request, db: Session = Depends(
 
 @app.delete("/admin/modules/{module_id}")
 def delete_module(module_id: int, db: Session = Depends(get_db)):
+    from models import StudentProgress as _SP
     m = db.query(SyllabusModule).filter(SyllabusModule.id == module_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Module not found")
+    content_ids = [r[0] for r in db.query(SyllabusContent.id).filter(SyllabusContent.module_id == module_id).all()]
+    if content_ids:
+        db.query(_SP).filter(_SP.content_id.in_(content_ids)).delete(synchronize_session=False)
+        db.query(SyllabusContent).filter(SyllabusContent.module_id == module_id).delete(synchronize_session=False)
     db.delete(m)
     db.commit()
     return {"message": "Module deleted"}
@@ -4620,13 +4778,22 @@ async def enroll_in_template(template_id: int, request: Request, db: Session = D
 
 
 @app.post("/scheduling/occurrences/{occ_id}/add-student")
-async def add_student_scoped(occ_id: int, request: Request, db: Session = Depends(get_db)):
-    """Recurrence-aware add. body: {student_id, scope: this|this_and_future}.
+async def add_student_scoped(
+    occ_id: int, request: Request, db: Session = Depends(get_db),
+    current=Depends(require_roles("super_admin", "center_admin")),
+):
+    """Recurrence-aware add. body: {student_id, scope: this|this_and_future, force}.
     Adds to the selected occurrence (and, for this_and_future, all later
-    occurrences in the SAME day/time stream — never other streams)."""
+    occurrences in the SAME day/time stream — never other streams).
+
+    Admin-only: a full class blocks with 409 unless force=true, letting the
+    admin knowingly overbook a slot (e.g. a makeup or trial). Teacher/student
+    booking paths (enroll_in_template, _student_reschedule) have no such
+    override — they hard-block on capacity, no exceptions."""
     body = await request.json()
     student_id = body.get("student_id")
     scope = body.get("scope", "this")
+    force = bool(body.get("force", False))
     if scope not in ("this", "this_and_future"):
         raise HTTPException(status_code=400, detail="scope must be this|this_and_future")
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
@@ -4638,21 +4805,31 @@ async def add_student_scoped(occ_id: int, request: Request, db: Session = Depend
     cap = o.template.capacity if o.template else None
     targets = _stream_occurrences(db, o, scope)
     added = 0
+    overbooked = False
     for occ in targets:
         roster = _occurrence_roster_ids(db, occ, base)
         if student_id in roster:
             continue
         if cap and len(roster) >= cap:
-            raise HTTPException(status_code=400, detail=f"Class on {occ.date} is full ({len(roster)}/{cap})")
+            if not force:
+                raise HTTPException(status_code=409, detail={
+                    "code": "capacity_exceeded",
+                    "date": occ.date,
+                    "current": len(roster),
+                    "capacity": cap,
+                    "message": f"Class on {occ.date} is full ({len(roster)}/{cap}).",
+                })
+            overbooked = True
         _assert_no_conflict(db, student_id, occ)
         _set_membership(db, occ, student_id, present=True, base_ids=base)
         added += 1
     if added:
         _reactivate_student_if_needed(db, student_id)
-        audit(db, "booking.booked", subject=("student", student_id),
-              detail=_booking_audit_detail(db, student_id, o, occurrences_affected=added, scope=scope))
+        detail = _booking_audit_detail(db, student_id, o, occurrences_affected=added, scope=scope,
+                                        capacity_overridden=overbooked)
+        audit(db, "booking.booked", subject=("student", student_id), detail=detail)
     db.commit()
-    return {"message": "Added", "occurrences_affected": added, "scope": scope}
+    return {"message": "Added", "occurrences_affected": added, "scope": scope, "overbooked": overbooked}
 
 
 @app.post("/scheduling/occurrences/{occ_id}/remove-student")
