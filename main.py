@@ -2095,6 +2095,7 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
         "active_package": package_info,
         "performance": {
             "attendance_percentage": att_pct,
+            "overall_grade": student.current_grade or "—",
             "total_classes": grand_total_classes,
             "total_attended": grand_total_attended,
             "progress_items_total": len(progress_records),
