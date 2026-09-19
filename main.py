@@ -4911,16 +4911,23 @@ def occurrence_attendance(occ_id: int, db: Session = Depends(get_db)):
             continue
         seen.add(s.id)
         a = att_map.get(s.id)
+        outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
+            Invoice.student_id == sid, Invoice.status != 'cancelled'
+        ).scalar() or 0
         rows.append({"student_id": s.id, "first_name": s.first_name, "last_name": s.last_name,
-                     "status": a.status if a else None, "notes": a.notes if a else None})
+                     "status": a.status if a else None, "notes": a.notes if a else None,
+                     "outstanding": round(outstanding, 2)})
     # Include any ad-hoc attendees not in the active roster (e.g. makeups).
     for sid, a in att_map.items():
         if sid in seen:
             continue
         s = db.query(Student).filter(Student.id == sid).first()
         if s:
+            outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
+                Invoice.student_id == sid, Invoice.status != 'cancelled'
+            ).scalar() or 0
             rows.append({"student_id": s.id, "first_name": s.first_name, "last_name": s.last_name,
-                         "status": a.status, "notes": a.notes})
+                         "status": a.status, "notes": a.notes, "outstanding": round(outstanding, 2)})
     return rows
 
 
