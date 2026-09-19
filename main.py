@@ -3718,6 +3718,9 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
             if not stu:
                 continue
             att = att_map.get(sid)
+            outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
+                Invoice.student_id == sid, Invoice.status != 'cancelled'
+            ).scalar() or 0
             result.append({
                 "id": stu.id,
                 "first_name": stu.first_name,
@@ -3727,6 +3730,7 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
                 "desired_course": stu.desired_course or stu.instrument or "",
                 "enrollment_type": "recurring",
                 "attendance": {"id": att.id, "status": att.status, "notes": att.notes} if att else None,
+                "outstanding": round(outstanding, 2),
             })
         return result
 
@@ -3736,6 +3740,9 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
         stu = students_map.get(att.student_id)
         if not stu:
             continue
+        outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
+            Invoice.student_id == att.student_id, Invoice.status != 'cancelled'
+        ).scalar() or 0
         result.append({
             "id": stu.id,
             "first_name": stu.first_name,
@@ -3745,6 +3752,7 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
             "desired_course": stu.desired_course or stu.instrument or "",
             "enrollment_type": att.enrollment_type or "single_session",
             "attendance": {"id": att.id, "status": att.status, "notes": att.notes},
+            "outstanding": round(outstanding, 2),
         })
     return result
 

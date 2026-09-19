@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(lsof -ti:5173 -sTCP:LISTEN)",
+      "Bash(xargs -r kill)",
+      "Bash(lsof -ti:8000 -sTCP:LISTEN)",
+      "Bash(curl -s -X DELETE \"http://127.0.0.1:8000/scheduling/occurrences/4785?scope=this\" -w \"\\\\nHTTP %{http_code}\\\\n\")",
+      "Bash(curl -s -X DELETE \"http://127.0.0.1:8000/scheduling/occurrences/4780?scope=this_and_future\" -w \"\\\\nHTTP %{http_code}\\\\n\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\)\")",
+      "Bash(curl -s -X DELETE \"http://127.0.0.1:8000/scheduling/occurrences/999999?scope=series\" -w \"\\\\nHTTP %{http_code}\\\\n\")",
+      "Bash(time curl -s \"http://127.0.0.1:8000/admin/reports?period=today&center_id=17\" -o /tmp/report_out.json -w \"HTTP %{http_code}\\\\n\")",
+      "Bash(curl -sf http://localhost:8000/)",
+      "Bash(break)",
+      "Bash(time curl -s \"http://127.0.0.1:8000/admin/reports?period=today&center_id=17\" -o /private/tmp/claude-501/-Users-yadavvignesh-vama-backend/e1e0fb56-1627-4f7b-9484-f5934cafa3d8/scratchpad/report_out.json -w \"HTTP %{http_code}\\\\n\")",
+      "Bash(time curl -s \"http://127.0.0.1:8000/admin/reports?period=today&center_id=17\" -o /private/tmp/claude-501/-Users-yadavvignesh-vama-backend/e1e0fb56-1627-4f7b-9484-f5934cafa3d8/scratchpad/report_out2.json -w \"HTTP %{http_code}\\\\n\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('models.py'\\).read\\(\\)\\)\")",
+      "Bash(python /private/tmp/claude-501/-Users-yadavvignesh-vama-backend/e1e0fb56-1627-4f7b-9484-f5934cafa3d8/scratchpad/test_exam_status.py)",
+      "Bash(npx eslint *)",
+      "Bash(git check-ignore *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8000/docs)",
+      "Bash(curl -s \"http://localhost:8000/admin/students-overview?center_id=17\")",
+      "Bash(xargs -r kill -9)",
+      "Bash(psql \"postgresql://neondb_owner:npg_zaD0pPOHxl6S@ep-patient-sea-a1he39si-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require\" -c \"select id, name, email, role from staff where role='Admin' limit 3;\")",
+      "Bash(curl -s -X POST http://localhost:8000/admin/students/281/instructors -H \"Content-Type: application/json\" -d '{\"teacher_id\": 6, \"instrument\": \"Piano\", \"grade\": \"Grade 2\", \"syllabus_type\": \"Trinity\", \"is_exam_student\": true, \"exam_date\": \"2026-12-15\"}')",
+      "Bash(curl -s -X POST http://localhost:8000/admin/students/281/instructors -H \"Content-Type: application/json\" -d '{\"teacher_id\": 6, \"instrument\": \"Guitar\", \"grade\": \"Debut\", \"syllabus_type\": \"RSL\"}')",
+      "Bash(curl -s http://localhost:8000/admin/students/281/instructors)",
+      "Bash(lsof -ti:5173)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('models.py'\\).read\\(\\)\\)\")",
+      "Bash(curl -s http://localhost:8000/admin/exam-sessions)",
+      "Bash(curl -s -X POST http://localhost:8000/admin/exam-sessions -H \"Content-Type: application/json\" -d '{\"name\":\"QA Test Session Delete Me\",\"exam_board\":\"Trinity\",\"exam_date\":\"2026-11-20\"}')",
+      "Bash(curl -s -X POST http://localhost:8000/admin/students/282/instructors -H \"Content-Type: application/json\" -d '{\"teacher_id\": 6, \"instrument\": \"Piano\", \"grade\": \"Grade 2\", \"syllabus_type\": \"Trinity\", \"is_exam_student\": true, \"exam_session_id\": 20}')",
+      "Bash(curl -s http://localhost:8000/admin/students/282/instructors)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}
