@@ -56,7 +56,7 @@ class Student(Base):
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
-    email = Column(String, unique=True, nullable=False, index=True)
+    email = Column(String, nullable=False, index=True)  # not unique — two siblings can share one login email
     guardian_email = Column(String, nullable=True, index=True)  # links siblings under one parent/guardian
     primary_phone_number = Column(String, nullable=True)
     date_of_birth = Column(String, nullable=True)
@@ -370,6 +370,7 @@ class StudentPackage(Base):
     makeup_used = Column(Integer, default=0)
     status = Column(String, default="active")  # active | expired | exhausted | cancelled | paused
     paused_at = Column(String, nullable=True)  # date (YYYY-MM-DD) the package was paused for a student break
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)  # the paid invoice this activation came from — guards against double-activation
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

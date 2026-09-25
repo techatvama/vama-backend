@@ -20,6 +20,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from database import get_db
 from models import Staff, Student, AuthToken, AuditLog, LoginAttempt, AppSetting
@@ -60,6 +61,16 @@ def find_by_email(db: Session, email: str):
         if obj:
             return stype, obj
     return None, None
+
+
+def staff_email_exists(db: Session, email: str) -> bool:
+    """Student.email allows duplicates (siblings can share a family login),
+    but a student account still shouldn't collide with a staff/admin login —
+    used when creating a student, in place of the full email_exists check."""
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    return db.query(Staff).filter(Staff.email.ilike(email)).first() is not None
 
 
 def email_exists(db: Session, email: str) -> bool:
@@ -547,12 +558,19 @@ async def change_password(request: Request, current: dict = Depends(get_current_
 def linked_students(db: Session, student) -> list:
     """Sibling student accounts under the same guardian — the children a
     parent can view/switch between from a single login. Always includes the
-    current student so the frontend can render a complete child switcher."""
+    current student so the frontend can render a complete child switcher.
+
+    Two children can be linked either via a shared guardian_email, or simply
+    by both having the same login email on their own Student.email field
+    (common when a parent's email was entered directly for each child
+    rather than through a separate guardian_email) — either signal counts."""
     q = db.query(Student).filter(Student.account_status != DISABLED)
+    conditions = []
     if student.guardian_email:
-        q = q.filter(Student.guardian_email.ilike(student.guardian_email))
-    else:
-        q = q.filter(Student.id == student.id)
+        conditions.append(Student.guardian_email.ilike(student.guardian_email))
+    if student.email:
+        conditions.append(Student.email.ilike(student.email))
+    q = q.filter(or_(*conditions)) if conditions else q.filter(Student.id == student.id)
     rows = q.all()
     if student.id not in [s.id for s in rows]:
         rows.append(student)

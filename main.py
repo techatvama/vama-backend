@@ -2,8 +2,8 @@ from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, 
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text, func, or_, not_
-from sqlalchemy.orm import Session
+from sqlalchemy import text, func, or_, not_, and_
+from sqlalchemy.orm import Session, joinedload
 from typing import Optional
 import os as _osmod
 import uuid
@@ -41,7 +41,7 @@ from models import (
 import scheduling
 import crud
 from schemas import StaffCreate
-from auth import router as auth_router, provision_account, email_exists, verify_credentials, audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email, roles_for, require_roles
+from auth import router as auth_router, provision_account, email_exists, staff_email_exists, verify_credentials, audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email, roles_for, require_roles
 import security
 import enrollment as _enrollment_module
 
@@ -533,17 +533,27 @@ async def student_login(request: Request, db: Session = Depends(get_db)):
     email = body.get("email", "").strip().lower()
     password = body.get("password", "")
 
-    student = db.query(Student).filter(
-        Student.email.ilike(email)
-    ).first()
-
-    if not student:
+    # A family can end up with more than one Student row sharing the same
+    # login email (e.g. one email used for two children, entered separately
+    # rather than via a shared guardian_email) — picking just the first match
+    # meant the second child's own password could never authenticate at all.
+    # Try every row with this email and log in as whichever one's password
+    # actually matches; the in-app sibling switcher (linked_students) then
+    # covers moving between them without a second login.
+    candidates = db.query(Student).filter(Student.email.ilike(email)).all()
+    if not candidates:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     import asyncio
     loop = asyncio.get_event_loop()
-    ok = await loop.run_in_executor(None, verify_credentials, db, student, password)
-    if not ok:
+    student = None
+    for candidate in candidates:
+        if await loop.run_in_executor(None, verify_credentials, db, candidate, password):
+            student = candidate
+            if (student.account_status or "active") == "active":
+                break  # prefer an active match, but keep the best one found so far
+
+    if not student:
         db.commit()
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if (student.account_status or "active") != "active":
@@ -1044,40 +1054,22 @@ def remove_student_instructor(student_id: int, track_id: int, db: Session = Depe
     return {"message": "Instructor removed"}
 
 
-def _unique_sibling_login_email(db: Session, family_email: str, first_name: str) -> str:
-    """Derive a unique, still-valid login email for a sibling whose family
-    only has one real address. Real mail always goes to family_email
-    (passed as notify_email to provision_account) — this value only needs
-    to be unique, not deliverable."""
-    import re as _re
-    local, _, domain = family_email.partition("@")
-    tag = _re.sub(r"[^a-z0-9]", "", (first_name or "").lower()) or "sibling"
-    candidate = f"{local}+{tag}@{domain}"
-    n = 2
-    while email_exists(db, candidate):
-        candidate = f"{local}+{tag}{n}@{domain}"
-        n += 1
-    return candidate
-
-
 @app.post("/students")
 async def create_student(request: Request, db: Session = Depends(get_db),
                         current = Depends(require_roles("super_admin", "center_admin"))):
     """Create a new student in the database and provision a pending-activation account.
 
-    A family's real email can be reused across siblings: if it's already taken
-    by another student, a unique-but-undeliverable login email is derived for
-    this one (see _unique_sibling_login_email), the real address is kept on
-    guardian_email (linking them for the child-switcher — see linked_students),
-    and the activation email still always goes to the real address."""
+    A family's real email can be reused across siblings — Student.email has no
+    uniqueness constraint for exactly this reason. Login tries every student
+    row matching the entered email against the entered password (see
+    /student/login) and the in-app switcher (linked_students) covers moving
+    between siblings afterward without a second login."""
     body = await request.json()
     family_email = (body.get("email") or "").strip().lower()
     if not family_email:
         raise HTTPException(status_code=400, detail="A valid email address is required")
 
     login_email = family_email
-    if email_exists(db, family_email):
-        login_email = _unique_sibling_login_email(db, family_email, body.get("first_name"))
 
     # Center admins automatically assign new students to their center.
     caller = current.get("obj")
@@ -1548,7 +1540,9 @@ async def submit_student_application(request: Request, db: Session = Depends(get
     # Collect any custom field responses (keys not in standard fields)
     custom_responses = {k: v for k, v in body.items() if k not in STANDARD_APPLICATION_FIELDS and v}
 
-    if email_exists(db, email):
+    # A family's email can already be on a sibling's student account — that's
+    # fine and expected. Only a collision with a staff/admin login is blocked.
+    if staff_email_exists(db, email):
         raise HTTPException(status_code=400, detail="An account with this email already exists")
 
     # Resolve center
@@ -1666,7 +1660,9 @@ async def approve_student_application(application_id: int, request: Request, db:
         raise HTTPException(status_code=404, detail="Application not found")
     if a.status != "pending":
         raise HTTPException(status_code=400, detail=f"Application is already {a.status}")
-    if email_exists(db, a.email):
+    # A family's email can already be on a sibling's student account — that's
+    # fine and expected. Only a collision with a staff/admin login is blocked.
+    if staff_email_exists(db, a.email):
         raise HTTPException(status_code=400, detail="An account with this email already exists")
 
     body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
@@ -1829,6 +1825,62 @@ def resolve_package_state(db: Session, sp: "StudentPackage") -> Optional[dict]:
     }
 
 
+def _activate_package_for_invoice(db: Session, inv: "Invoice"):
+    """When an admin-created invoice for a package is marked paid, activate (or
+    queue, behind an existing active package) the StudentPackage it paid for —
+    mirroring what the student-side Razorpay checkout does automatically.
+    Without this, an invoice could show "Paid" while the student still has no
+    active package and can't book/reschedule classes.
+
+    Idempotent: skips if this invoice already has a StudentPackage tied to it
+    (invoice_id), so re-saving an already-paid invoice never double-activates."""
+    if not inv.package_id:
+        return
+    if db.query(StudentPackage).filter(StudentPackage.invoice_id == inv.id).first():
+        return
+    pkg = db.query(Package).filter(Package.id == inv.package_id).first()
+    if not pkg:
+        return
+
+    from datetime import date, timedelta
+    today_d = date.today()
+
+    active_sp = db.query(StudentPackage).filter(
+        StudentPackage.student_id == inv.student_id,
+        StudentPackage.status == "active",
+    ).order_by(StudentPackage.created_at.desc()).first()
+
+    if active_sp:
+        state = resolve_package_state(db, active_sp)
+        if state and state["sessions_remaining"] > 0 and not state["is_expired"]:
+            queue_start = active_sp.end_date or str(today_d)
+            queue_end = str((date.fromisoformat(queue_start) + timedelta(days=pkg.validity_days or 30)))
+            new_status = "queued"
+            start, end = queue_start, queue_end
+        else:
+            active_sp.status = "expired" if state and state["is_expired"] else "exhausted"
+            start = str(today_d)
+            end = str(today_d + timedelta(days=pkg.validity_days or 30))
+            new_status = "active"
+    else:
+        start = str(today_d)
+        end = str(today_d + timedelta(days=pkg.validity_days or 30))
+        new_status = "active"
+
+    for old_q in db.query(StudentPackage).filter(
+        StudentPackage.student_id == inv.student_id,
+        StudentPackage.status == "queued",
+    ).all():
+        old_q.status = "cancelled"
+
+    db.add(StudentPackage(
+        student_id=inv.student_id, package_id=inv.package_id,
+        start_date=str(start), end_date=str(end),
+        sessions_used=0, makeup_used=0, status=new_status,
+        invoice_id=inv.id,
+    ))
+
+
 def get_active_student_package(db: Session, student_id: int, persist: bool = True):
     """Return the active StudentPackage for a student, or None.
 
@@ -1962,33 +2014,75 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
 
     teacher = db.query(Staff).filter(Staff.id == student.teacher_id).first() if student.teacher_id else None
 
-    # ── Enrollments + attendance ────────────────────────────
-    enrollments = db.query(StudentEnrollment).filter(StudentEnrollment.student_id == student_id).all()
-    enrollment_data = []
-    grand_total_classes = 0
-    grand_total_attended = 0
+    # ── Enrollments + attendance (current scheduling schema: ClassTemplate /
+    #    ClassOccurrence / Enrollment — the legacy Batch/ClassSession/
+    #    StudentEnrollment tables are no longer populated by the scheduler) ──
+    today_str = _date.today().isoformat()
 
-    for enr in enrollments:
-        batch = db.query(Batch).filter(Batch.id == enr.batch_id).first()
-        if not batch:
+    base_enrolls = db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.occurrence_id.is_(None),
+        Enrollment.status == "active",
+    ).all()
+    base_tpl_ids = {e.template_id for e in base_enrolls}
+
+    overrides = db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.occurrence_id.isnot(None),
+    ).all()
+    excl_occ_ids = {e.occurrence_id for e in overrides if e.kind == "exclude"}
+    incl_occ_ids = {e.occurrence_id for e in overrides if e.kind == "include" and e.status == "active"}
+
+    roster_occs = db.query(ClassOccurrence).filter(
+        or_(
+            and_(ClassOccurrence.template_id.in_(base_tpl_ids or [-1]), ClassOccurrence.id.notin_(excl_occ_ids or [-1])),
+            ClassOccurrence.id.in_(incl_occ_ids or [-1]),
+        )
+    ).all()
+
+    templates_map = {t.id: t for t in db.query(ClassTemplate).filter(
+        ClassTemplate.id.in_({o.template_id for o in roster_occs if o.template_id} or [-1])
+    ).all()}
+    teacher_ids = {o.teacher_id for o in roster_occs if o.teacher_id}
+    teachers_map = {s.id: s for s in db.query(Staff).filter(Staff.id.in_(teacher_ids or [-1])).all()}
+
+    # A class counts toward the "delivered" total once its date has passed, or —
+    # for today's date specifically — once a teacher has actually marked
+    # attendance for it (a same-day class taught earlier today shouldn't be
+    # excluded just because its date isn't strictly before today).
+    marked_occ_ids = {a.session_id for a in db.query(Attendance.session_id).filter(
+        Attendance.student_id == student_id).all()}
+    past_occs = [o for o in roster_occs if o.status != "cancelled"
+                 and (o.date < today_str or (o.date == today_str and o.id in marked_occ_ids))]
+    past_occ_ids = [o.id for o in past_occs]
+    grand_total_classes = len(past_occ_ids)
+    grand_total_attended = db.query(Attendance).filter(
+        Attendance.session_id.in_(past_occ_ids or [-1]),
+        Attendance.student_id == student_id, Attendance.status == "present",
+    ).count() if past_occ_ids else 0
+
+    # One list entry per distinct class the student appears on the roster for,
+    # whether via a recurring baseline enrollment or a one-off per-occurrence
+    # "include" booking — most current bookings are the latter, so limiting
+    # this to base_tpl_ids alone left the Classes tab empty for them.
+    all_tpl_ids = base_tpl_ids | {o.template_id for o in roster_occs if o.template_id}
+    enrollment_data = []
+    for tid in all_tpl_ids:
+        t = templates_map.get(tid)
+        if not t:
             continue
-        batch_teacher = db.query(Staff).filter(Staff.id == batch.teacher_id).first() if batch.teacher_id else None
-        sessions = db.query(ClassSession).filter(ClassSession.batch_id == enr.batch_id).all()
-        session_ids = [s.id for s in sessions]
+        tmpl_past_ids = [o.id for o in past_occs if o.template_id == tid]
+        tmpl_teacher_ids = {o.teacher_id for o in roster_occs if o.template_id == tid and o.teacher_id}
+        teacher_name = teachers_map[next(iter(tmpl_teacher_ids))].name if tmpl_teacher_ids else "—"
         attended = db.query(Attendance).filter(
-            Attendance.session_id.in_(session_ids),
-            Attendance.student_id == student_id,
-            Attendance.status == "present"
-        ).count() if session_ids else 0
-        total = len(sessions)
-        grand_total_classes += total
-        grand_total_attended += attended
+            Attendance.session_id.in_(tmpl_past_ids or [-1]),
+            Attendance.student_id == student_id, Attendance.status == "present",
+        ).count() if tmpl_past_ids else 0
+        total = len(tmpl_past_ids)
         enrollment_data.append({
-            "id": enr.id,
-            "subject": batch.subject or batch.name,
-            "batch_name": batch.name,
-            "teacher": batch_teacher.name if batch_teacher else "—",
-            "start_date": enr.enrolled_at.isoformat() if enr.enrolled_at else None,
+            "id": tid,
+            "subject": t.course or t.name,
+            "batch_name": t.name,
+            "teacher": teacher_name,
+            "start_date": None,
             "status": "active",
             "total_classes": total,
             "attended": attended,
@@ -1996,27 +2090,32 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
             "attendance_rate": round((attended / total) * 100) if total else 0,
         })
 
-    # ── Upcoming sessions ───────────────────────────────────
-    today_str = _date.today().isoformat()
+    # ── Upcoming sessions ─────────────────────────────────── a class dated
+    # today that's already been marked belongs in the attendance log, not
+    # here — it already happened, "upcoming" would be misleading.
+    already_happened_ids = set(past_occ_ids)
+    future_occs = sorted(
+        (o for o in roster_occs
+         if o.date >= today_str and o.status != "cancelled" and o.id not in already_happened_ids),
+        key=lambda o: (o.date, o.start_time or ""),
+    )
     upcoming = []
-    for enr in enrollments:
-        batch = db.query(Batch).filter(Batch.id == enr.batch_id).first()
-        if not batch:
-            continue
-        batch_teacher = db.query(Staff).filter(Staff.id == batch.teacher_id).first() if batch.teacher_id else None
-        sessions = db.query(ClassSession).filter(
-            ClassSession.batch_id == enr.batch_id,
-            ClassSession.date >= today_str
-        ).order_by(ClassSession.date).limit(3).all()
-        for s in sessions:
-            upcoming.append({
-                "id": s.id,
-                "subject": batch.subject or batch.name,
-                "date": s.date,
-                "time": f"{s.start_time} - {s.end_time}",
-                "teacher": batch_teacher.name if batch_teacher else "—",
-            })
-    upcoming = upcoming[:5]
+    for o in future_occs[:5]:
+        t = templates_map.get(o.template_id)
+        teacher = teachers_map.get(o.teacher_id)
+        upcoming.append({
+            "id": o.id,
+            "subject": (t.course or t.name) if t else None,
+            "date": o.date,
+            "time": f"{o.start_time} - {o.end_time}",
+            "teacher": teacher.name if teacher else "—",
+        })
+
+    # "Classes" stat = classes already held this calendar month (month start → today)
+    month_start = _date.today().replace(day=1)
+    classes_done_this_month = sum(
+        1 for o in past_occs if o.date >= month_start.isoformat()
+    )
 
     # ── Payment history ─────────────────────────────────────
     invoices = db.query(Invoice).filter(Invoice.student_id == student_id).order_by(Invoice.issue_date.desc()).all()
@@ -2092,6 +2191,7 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
         },
         "enrollments": enrollment_data,
         "upcoming_classes": upcoming,
+        "classes_this_month": classes_done_this_month,
         "active_package": package_info,
         "performance": {
             "attendance_percentage": att_pct,
@@ -2107,21 +2207,48 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
 
 # ==================== Progress / Syllabus ====================
 
-def _build_progress_response(student: Student, db: Session):
-    """Build the full progress response for a student."""
+def _build_progress_response(student: Student, db: Session, subject: Optional[str] = None):
+    """Build the full progress response for a student.
+
+    A student can be enrolled in more than one subject (LearningEnrollment —
+    the "single source of truth" per its own docstring for exactly this kind
+    of student-portal content filtering). `enrolled_subjects` lists every
+    subject/grade the student is actually taking, and `subject` picks which
+    one's syllabus to return — the frontend uses this to render a tab per
+    subject. Most students today predate LearningEnrollment and only have
+    the legacy single instrument/current_grade fields on Student itself, so
+    that stays the fallback: same single-subject behavior as before, just
+    wrapped in a one-item enrolled_subjects list so the tab UI has something
+    consistent to render (and simply doesn't show tabs for a single item).
+    """
+    active_enrollments = db.query(LearningEnrollment).filter(
+        LearningEnrollment.student_id == student.id, LearningEnrollment.status == "active",
+    ).order_by(LearningEnrollment.created_at).all()
+
+    if active_enrollments:
+        enrolled_subjects = [
+            {"subject": e.subject, "grade": e.grade, "syllabus_type": e.syllabus_type}
+            for e in active_enrollments
+        ]
+        target = next((e for e in active_enrollments if e.subject == subject), active_enrollments[0])
+        target_subject, target_grade = target.subject, target.grade
+    else:
+        target_subject = student.instrument or student.desired_course
+        target_grade = student.current_grade
+        enrolled_subjects = [{"subject": target_subject, "grade": target_grade, "syllabus_type": student.syllabus_type or "Trinity"}]
+
     # Match the syllabus by subject + grade — the same combination the
     # Syllabus Builder treats as a unique identity when creating one. Matching
     # on syllabus_type as well used to be the primary path, but the builder
-    # never sets that field (it's always NULL), while students default to
-    # 'Trinity' — so that comparison never matched anything, and every
-    # lookup silently fell back to "any syllabus for this subject" with no
-    # grade filter at all. That's harmless while each subject only has one
-    # grade's worth of content, but it means a Grade 1 and a Grade 5 student
-    # taking the same instrument would be shown the exact same syllabus the
-    # moment a second grade level exists for that subject.
+    # never sets that field (it's always NULL) — so that comparison never
+    # matched anything, and every lookup silently fell back to "any syllabus
+    # for this subject" with no grade filter at all. That's harmless while
+    # each subject only has one grade's worth of content, but it means a
+    # Grade 1 and a Grade 5 student taking the same instrument would be
+    # shown the exact same syllabus the moment a second grade level exists.
     syllabus = db.query(Syllabus).filter(
-        Syllabus.subject == (student.instrument or student.desired_course),
-        Syllabus.grade_name == student.current_grade,
+        Syllabus.subject == target_subject,
+        Syllabus.grade_name == target_grade,
     ).first()
 
     student_data = {
@@ -2130,15 +2257,16 @@ def _build_progress_response(student: Student, db: Session):
         "last_name": student.last_name,
         "name": f"{student.first_name} {student.last_name}",
         "email": student.email,
-        "instrument": student.instrument or student.desired_course or "Music",
-        "grade": student.current_grade or "Debut",
-        "current_grade": student.current_grade or "Debut",
+        "instrument": target_subject or "Music",
+        "grade": target_grade or "Debut",
+        "current_grade": target_grade or "Debut",
         "desired_course": student.desired_course or "",
         "primary_phone_number": student.primary_phone_number or "",
         "nearest_vama_center": student.nearest_vama_center or "",
         "syllabus_type": student.syllabus_type or "Trinity",
         "is_exam_student": student.is_exam_student or False,
         "exam_date": student.exam_date,
+        "enrolled_subjects": enrolled_subjects,
     }
 
     if not syllabus:
@@ -2190,11 +2318,11 @@ def _build_progress_response(student: Student, db: Session):
 
 
 @app.get("/students/{student_id}/progress")
-def get_student_progress(student_id: int, db: Session = Depends(get_db)):
+def get_student_progress(student_id: int, subject: Optional[str] = None, db: Session = Depends(get_db)):
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
-    return _build_progress_response(student, db)
+    return _build_progress_response(student, db, subject=subject)
 
 
 @app.post("/students/{student_id}/progress/{content_id}")
@@ -2611,16 +2739,20 @@ def get_student_attendance(student_id: int, db: Session = Depends(get_db)):
     occ_map = {o.id: o for o in db.query(ClassOccurrence).filter(ClassOccurrence.id.in_(occ_ids or [-1])).all()}
     tpl_map = {t.id: t for t in db.query(ClassTemplate).filter(
         ClassTemplate.id.in_({o.template_id for o in occ_map.values() if o.template_id} or [-1])).all()}
+    teacher_map = {s.id: s for s in db.query(Staff).filter(
+        Staff.id.in_({o.teacher_id for o in occ_map.values() if o.teacher_id} or [-1])).all()}
     out = []
     for a in atts:
         o = occ_map.get(a.session_id)
         t = tpl_map.get(o.template_id) if o else None
+        teacher = teacher_map.get(o.teacher_id) if o and o.teacher_id else None
         out.append({
             "id": a.id, "session_id": a.session_id, "status": a.status, "notes": a.notes,
             "created_at": a.marked_at.isoformat() if a.marked_at else None,
             "session": ({
                 "date": o.date, "start_time": o.start_time, "end_time": o.end_time,
                 "batch": {"subject": t.course if t else None, "name": t.name if t else None},
+                "teacher_name": teacher.name if teacher else None,
             } if o else None),
         })
     # Newest first (by occurrence date when available, else id).
@@ -2638,19 +2770,29 @@ def _bookable_occurrences_query(db, *, status_scheduled_only=True):
     return q
 
 
-def _slot_counts(db, occ):
+def _slot_counts(db, occ, base_ids=None):
     t = occ.template
     cap = (t.capacity if t else 0) or 0
-    cnt = len(_occurrence_roster_ids(db, occ)) if occ.template_id else 0
+    cnt = len(_occurrence_roster_ids(db, occ, base_ids)) if occ.template_id else 0
     return cap, cnt
 
 
-def _student_is_free_for(db, student_id, occ, exclude_occurrence_id, date_cache):
+def _student_is_free_for(db, student_id, occ, exclude_occurrence_id, date_cache, baseline_cache=None):
     """True if the student can be offered `occ` as a bookable slot: not already
     on its roster, and no time overlap with anything else they're booked into
     that date. `date_cache` memoizes the per-date occurrence lookup across a
-    batch of candidate slots sharing the same date range."""
-    if student_id in _occurrence_roster_ids(db, occ):
+    batch of candidate slots sharing the same date range. `baseline_cache`
+    (optional, keyed by template_id) memoizes baseline roster lookups across
+    a batch of candidates that share templates — recurring classes can have
+    100+ occurrences on the same template, and without this every one of
+    them re-queries the same baseline enrollment from scratch."""
+    if baseline_cache is not None:
+        if occ.template_id not in baseline_cache:
+            baseline_cache[occ.template_id] = _baseline_ids(db, occ.template_id)
+        base_ids = baseline_cache[occ.template_id]
+    else:
+        base_ids = None
+    if student_id in _occurrence_roster_ids(db, occ, base_ids):
         return False
     if occ.date not in date_cache:
         date_cache[occ.date] = _student_effective_occurrences_on_date(
@@ -2692,30 +2834,149 @@ def student_instructor_slots(student_id: int, session_id: int, slot_date: str, d
 
 @app.get("/student/{student_id}/available-slots")
 def student_available_slots(student_id: int, start: Optional[str] = None, end: Optional[str] = None,
-                            subject: Optional[str] = None, db: Session = Depends(get_db)):
-    """Bookable slots in a date range, optionally by subject. Cancelled,
-    already-booked, and time-conflicting occurrences are excluded."""
+                            subject: Optional[str] = None, teacher_id: Optional[int] = None,
+                            template_id: Optional[int] = None,
+                            db: Session = Depends(get_db)):
+    """Bookable slots in a date range, optionally by subject, teacher, and/or
+    the exact class template. Cancelled, already-booked, and time-conflicting
+    occurrences are excluded.
+
+    Pass template_id when rescheduling within one specific class: several
+    "same teacher, same subject" duplicate class records can exist in this
+    data (a real, separate cleanup problem — see the ClassTemplate dedup
+    notes), each generating its own occurrences, sometimes with junk
+    recurrence patterns (e.g. a class accidentally scheduled every single
+    day). Filtering by subject+teacher alone surfaces all of them mixed
+    together; template_id scopes strictly to the one class actually being
+    rescheduled.
+
+    This used to check each candidate occurrence one at a time — a roster
+    query and a same-date conflict query per occurrence — which meant a
+    recurring class with 100+ occurrences (or a multi-week window across
+    several such classes) fired hundreds of individual round-trips to the
+    database and could take the better part of a minute to respond. It's
+    rewritten here to fetch each piece of data (rosters, overrides, the
+    student's own schedule) in one batched query and do the per-occurrence
+    filtering in Python instead.
+    """
     staff_map = {s.id: s.name for s in db.query(Staff).all()}
-    q = _bookable_occurrences_query(db)
+
+    q = _bookable_occurrences_query(db).options(joinedload(ClassOccurrence.template))
     if start:
         q = q.filter(ClassOccurrence.date >= start)
     if end:
         q = q.filter(ClassOccurrence.date <= end)
+    if teacher_id:
+        q = q.filter(ClassOccurrence.teacher_id == teacher_id)
+    if template_id:
+        q = q.filter(ClassOccurrence.template_id == template_id)
+    elif subject:
+        q = q.join(ClassTemplate, ClassOccurrence.template_id == ClassTemplate.id).filter(ClassTemplate.course == subject)
+    candidates = q.order_by(ClassOccurrence.date, ClassOccurrence.start_time).all()
+    if not candidates:
+        return []
+
+    cand_ids = [o.id for o in candidates]
+    cand_template_ids = {o.template_id for o in candidates if o.template_id}
+
+    # Baseline roster (all students) for every candidate's template, one query.
+    baseline_by_tmpl = {}
+    for tid, sid in db.query(Enrollment.template_id, Enrollment.student_id).filter(
+        Enrollment.template_id.in_(cand_template_ids or [-1]),
+        Enrollment.occurrence_id.is_(None), Enrollment.status == "active",
+    ).all():
+        baseline_by_tmpl.setdefault(tid, set()).add(sid)
+
+    # Per-occurrence include/exclude overrides for every candidate, one query.
+    overrides_by_occ = {}
+    for oid, sid, kind in db.query(Enrollment.occurrence_id, Enrollment.student_id, Enrollment.kind).filter(
+        Enrollment.occurrence_id.in_(cand_ids)
+    ).all():
+        d = overrides_by_occ.setdefault(oid, {"inc": set(), "exc": set()})
+        d["inc" if kind == "include" else "exc"].add(sid)
+
+    def roster_for(o):
+        base = baseline_by_tmpl.get(o.template_id, set())
+        ov = overrides_by_occ.get(o.id)
+        return ((base - ov["exc"]) | ov["inc"]) if ov else base
+
+    # The student's own effective schedule across the same range (for the
+    # same-day time-conflict check) — baseline templates they're in, plus
+    # their own per-occurrence overrides, three queries total regardless of
+    # how many occurrences that spans.
+    student_base_tpls = [e.template_id for e in db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.occurrence_id.is_(None), Enrollment.status == "active",
+    ).all()]
+    student_overrides = db.query(Enrollment).filter(
+        Enrollment.student_id == student_id, Enrollment.occurrence_id.isnot(None),
+    ).all()
+    excl_ids = {e.occurrence_id for e in student_overrides if e.kind == "exclude"}
+    incl_ids = {e.occurrence_id for e in student_overrides if e.kind == "include" and e.status == "active"}
+
+    base_q = db.query(ClassOccurrence).filter(
+        ClassOccurrence.template_id.in_(student_base_tpls or [-1]), ClassOccurrence.status == "scheduled",
+    )
+    if start:
+        base_q = base_q.filter(ClassOccurrence.date >= start)
+    if end:
+        base_q = base_q.filter(ClassOccurrence.date <= end)
+    base_occs = base_q.all()
+    base_ids_found = {o.id for o in base_occs}
+    need_fetch_incl = incl_ids - base_ids_found
+    incl_occs = (
+        db.query(ClassOccurrence).filter(ClassOccurrence.id.in_(need_fetch_incl)).all()
+        if need_fetch_incl else []
+    )
+    student_sched_by_date = {}
+    for o in base_occs:
+        if o.id in excl_ids:
+            continue
+        student_sched_by_date.setdefault(o.date, []).append(o)
+    for o in incl_occs:
+        student_sched_by_date.setdefault(o.date, []).append(o)
+
     out = []
-    date_cache = {}
-    for o in q.order_by(ClassOccurrence.date, ClassOccurrence.start_time).all():
+    for o in candidates:
+        if student_id in roster_for(o):
+            continue
+        conflict = any(
+            so.id != o.id and _times_overlap(o.start_time, o.end_time, so.start_time, so.end_time)
+            for so in student_sched_by_date.get(o.date, [])
+        )
+        if conflict:
+            continue
         t = o.template
-        if subject and t and (t.course or "") != subject:
-            continue
-        if not _student_is_free_for(db, student_id, o, None, date_cache):
-            continue
-        cap, cnt = _slot_counts(db, o)
+        cap = (t.capacity if t else 0) or 0
+        cnt = len(roster_for(o))
         out.append({
             "id": o.id, "date": o.date, "start_time": o.start_time, "end_time": o.end_time,
             "subject": t.course if t else "", "teacher_name": staff_map.get(o.teacher_id),
             "enrolled": cnt, "capacity": cap, "batch_id": o.template_id,
         })
-    return out
+
+    # Duplicate class templates (same teacher/subject/name entered more than
+    # once — a real, separate data problem, not something this endpoint can
+    # fix) generate separate occurrence rows that land on the exact same
+    # date/time/teacher. Shown side by side they look like the same slot
+    # offered twice, and deleting one "twin" leaves the other still
+    # bookable, which reads as "the slot I deleted is still there." Collapse
+    # same date+time+teacher down to a single offer — the one with the most
+    # open seats — until the underlying duplicate templates are cleaned up.
+    best_by_key = {}
+    for slot in out:
+        key = (slot["date"], slot["start_time"], slot["teacher_name"])
+        current = best_by_key.get(key)
+        if current is None:
+            best_by_key[key] = slot
+            continue
+        open_seats = lambda s: (s["capacity"] - s["enrolled"]) if s["capacity"] else 10**9
+        if open_seats(slot) > open_seats(current) or (
+            open_seats(slot) == open_seats(current) and slot["id"] < current["id"]
+        ):
+            best_by_key[key] = slot
+    deduped = list(best_by_key.values())
+    deduped.sort(key=lambda s: (s["date"], s["start_time"]))
+    return deduped
 
 
 def _student_reschedule(db, student_id, old_id, new_id, is_makeup=True):
@@ -2821,6 +3082,39 @@ async def student_reschedule(student_id: int, request: Request, db: Session = De
     new_id = body.get("new_session_id")
     new_sess = db.query(ClassOccurrence).filter(ClassOccurrence.id == new_id).first() if new_id else None
     assert_can_book(db, student_id, new_sess, count=1, is_makeup=True)
+    return _student_reschedule(db, student_id, old_id, new_id)
+
+
+@app.post("/student/{student_id}/book")
+async def student_book_extra_class(student_id: int, request: Request, db: Session = Depends(get_db)):
+    """Book an extra slot without cancelling anything else — same booking
+    engine as reschedule, just with no old_session_id to release. Draws from
+    the makeup quota (mirrors reschedule): the regular quota is what the
+    student's recurring enrollment already consumes automatically, so a
+    self-service 'book an extra class' is the same kind of flexible,
+    separately-tracked session a makeup is."""
+    body = await request.json()
+    new_id = body.get("session_id") or body.get("new_session_id")
+    new_sess = db.query(ClassOccurrence).filter(ClassOccurrence.id == new_id).first() if new_id else None
+    assert_can_book(db, student_id, new_sess, count=1, is_makeup=True)
+    return _student_reschedule(db, student_id, None, new_id)
+
+
+@app.post("/admin/students/{student_id}/reschedule")
+async def admin_student_reschedule(
+    student_id: int, request: Request, db: Session = Depends(get_db),
+    current=Depends(require_roles("super_admin", "center_admin")),
+):
+    """Admin-initiated reschedule — same slot swap as the student portal's own
+    /reschedule, but without the active-package gate. The package check exists
+    to stop a student from self-booking beyond what they've paid for; it has
+    no business blocking an admin who's fixing or moving a class on their
+    behalf (mirrors add_student_scoped, which is admin-only for the same
+    reason: student/teacher self-service booking paths hard-block, admin
+    paths don't)."""
+    body = await request.json()
+    old_id = body.get("old_session_id")
+    new_id = body.get("new_session_id")
     return _student_reschedule(db, student_id, old_id, new_id)
 
 
@@ -3709,6 +4003,7 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
         # Build roster from Enrollment table (baseline − excludes ∪ includes)
         base_ids = _baseline_ids(db, occ.template_id)
         roster_ids = _occurrence_roster_ids(db, occ, base_ids)
+        subject = occ.template.course if occ.template else None
 
         students_map = {s.id: s for s in db.query(Student).filter(Student.id.in_(roster_ids)).all()} if roster_ids else {}
         att_map = {a.student_id: a for a in db.query(Attendance).filter(Attendance.session_id == session_id).all()}
@@ -3719,9 +4014,7 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
             if not stu:
                 continue
             att = att_map.get(sid)
-            outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
-                Invoice.student_id == sid, Invoice.status != 'cancelled'
-            ).scalar() or 0
+            outstanding, has_invoice = _outstanding_for_subject(db, sid, subject)
             result.append({
                 "id": stu.id,
                 "first_name": stu.first_name,
@@ -3731,19 +4024,19 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
                 "desired_course": stu.desired_course or stu.instrument or "",
                 "enrollment_type": "recurring",
                 "attendance": {"id": att.id, "status": att.status, "notes": att.notes} if att else None,
-                "outstanding": round(outstanding, 2),
+                "outstanding": outstanding,
+                "has_invoice": has_invoice,
             })
         return result
 
+    subject = sess.batch.subject if sess.batch else None
     students_map = {s.id: s for s in db.query(Student).all()}
     result = []
     for att in db.query(Attendance).filter(Attendance.session_id == session_id).all():
         stu = students_map.get(att.student_id)
         if not stu:
             continue
-        outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
-            Invoice.student_id == att.student_id, Invoice.status != 'cancelled'
-        ).scalar() or 0
+        outstanding, has_invoice = _outstanding_for_subject(db, att.student_id, subject)
         result.append({
             "id": stu.id,
             "first_name": stu.first_name,
@@ -3753,7 +4046,8 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
             "desired_course": stu.desired_course or stu.instrument or "",
             "enrollment_type": att.enrollment_type or "single_session",
             "attendance": {"id": att.id, "status": att.status, "notes": att.notes},
-            "outstanding": round(outstanding, 2),
+            "outstanding": outstanding,
+            "has_invoice": has_invoice,
         })
     return result
 
@@ -4427,6 +4721,46 @@ def _split_series(db, template: ClassTemplate, target_date: str, edits: dict) ->
 
 # ── Templates ──
 
+def _assert_no_duplicate_template(db, *, teacher_id, course, start_time, rec, center_id, exclude_template_id=None):
+    """Reject creating/editing a class template if it would put the same
+    teacher in a class of the same subject at the same time on a day they
+    already have one — the exact pattern that produced 9 near-identical
+    "DRUMS Class Chiru" templates and similar duplicates elsewhere. Checked
+    against the dates this recurrence would *actually* generate (not just
+    "same weekday" in the abstract), so a daily/monthly/custom rule is
+    caught just as reliably as a weekly one, and before anything is written
+    so a rejected request leaves no partial rows behind."""
+    if not (teacher_id and course and start_time and rec.get("freq") and rec.get("start_date")):
+        return
+    trial_rule = RecurrenceRule(
+        freq=rec["freq"].lower(), interval=int(rec.get("interval") or 1),
+        by_weekday=rec.get("by_weekday"), by_monthday=rec.get("by_monthday"),
+        start_date=rec["start_date"], end_date=rec.get("end_date"),
+    )
+    holidays = scheduling.holiday_dates_for(db, center_id)
+    wanted_dates = {scheduling._fmt(d) for d in scheduling.expand_occurrences(trial_rule, holiday_dates=holidays)}
+    if not wanted_dates:
+        return
+    q = db.query(ClassOccurrence).join(
+        ClassTemplate, ClassOccurrence.template_id == ClassTemplate.id
+    ).filter(
+        ClassOccurrence.teacher_id == teacher_id,
+        ClassOccurrence.start_time == start_time,
+        ClassOccurrence.status == "scheduled",
+        ClassOccurrence.date.in_(wanted_dates),
+        ClassTemplate.course == course,
+    )
+    if exclude_template_id:
+        q = q.filter(ClassTemplate.id != exclude_template_id)
+    conflict = q.order_by(ClassOccurrence.date).first()
+    if conflict:
+        raise HTTPException(status_code=400, detail=(
+            f"This teacher already has a {course} class at {start_time} on {conflict.date} "
+            f"(class \"{conflict.template.name if conflict.template else ''}\"). "
+            "Pick a different time/day, or edit that existing class instead of creating a new one."
+        ))
+
+
 @app.post("/scheduling/templates")
 async def create_template(request: Request, db: Session = Depends(get_db),
                          current = Depends(require_roles("super_admin", "center_admin"))):
@@ -4474,6 +4808,11 @@ async def create_template(request: Request, db: Session = Depends(get_db),
     center_id = body.get("center_id")
     if not center_id and caller and getattr(caller, "access_role", None) == "center_admin":
         center_id = getattr(caller, "center_id", None)
+
+    _assert_no_duplicate_template(
+        db, teacher_id=body.get("teacher_id"), course=course_in,
+        start_time=body["start_time"], rec=rec, center_id=center_id,
+    )
 
     t = ClassTemplate(
         name=name_in, course=course_in,
@@ -4549,14 +4888,6 @@ async def update_template(template_id: int, request: Request, db: Session = Depe
         raise HTTPException(status_code=403, detail="You can only edit your own center's templates")
 
     _validate_times(body.get("start_time", t.start_time), body.get("end_time", t.end_time))
-    for f in ("name", "course", "teacher_id", "center_id", "room_id", "start_time", "end_time", "capacity"):
-        if f in body:
-            setattr(t, f, body[f])
-    # Accept "title"/"subject" aliases
-    if "title" in body and "name" not in body:
-        t.name = body["title"]
-    if "subject" in body and "course" not in body:
-        t.course = body["subject"]
 
     # Accept flat recurrence fields OR nested recurrence object
     rec = body.get("recurrence")
@@ -4570,6 +4901,38 @@ async def update_template(template_id: int, request: Request, db: Session = Depe
         r = t.rule
         _validate_rule(rec.get("freq", r.freq), rec.get("by_weekday", r.by_weekday),
                        rec.get("start_date", r.start_date), rec.get("end_date", r.end_date))
+
+    # Check the edit's effective schedule (merging body overrides onto the
+    # template's current values) for a same-teacher/subject/time collision
+    # with another template, before mutating anything.
+    effective_course = body.get("course") or body.get("subject") or t.course
+    effective_teacher = body.get("teacher_id", t.teacher_id)
+    effective_start = body.get("start_time", t.start_time)
+    r_existing = t.rule
+    effective_rec = {
+        "freq": (rec or {}).get("freq", r_existing.freq if r_existing else None),
+        "interval": (rec or {}).get("interval", r_existing.interval if r_existing else 1),
+        "by_weekday": (rec or {}).get("by_weekday", r_existing.by_weekday if r_existing else None),
+        "by_monthday": (rec or {}).get("by_monthday", r_existing.by_monthday if r_existing else None),
+        "start_date": (rec or {}).get("start_date", r_existing.start_date if r_existing else None),
+        "end_date": (rec or {}).get("end_date", r_existing.end_date if r_existing else None),
+    }
+    _assert_no_duplicate_template(
+        db, teacher_id=effective_teacher, course=effective_course, start_time=effective_start,
+        rec=effective_rec, center_id=body.get("center_id", t.center_id), exclude_template_id=t.id,
+    )
+
+    for f in ("name", "course", "teacher_id", "center_id", "room_id", "start_time", "end_time", "capacity"):
+        if f in body:
+            setattr(t, f, body[f])
+    # Accept "title"/"subject" aliases
+    if "title" in body and "name" not in body:
+        t.name = body["title"]
+    if "subject" in body and "course" not in body:
+        t.course = body["subject"]
+
+    if rec:
+        r = t.rule
         for f in ("freq", "interval", "by_weekday", "by_monthday", "start_date", "end_date"):
             if f in rec:
                 setattr(r, f, rec[f])
@@ -4902,6 +5265,7 @@ def occurrence_attendance(occ_id: int, db: Session = Depends(get_db)):
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    subject = o.template.course if o.template else None
     att_map = {a.student_id: a for a in db.query(Attendance).filter(Attendance.session_id == occ_id).all()}
     rows = []
     roster_ids = _occurrence_roster_ids(db, o) if o.template_id else set()
@@ -4912,23 +5276,19 @@ def occurrence_attendance(occ_id: int, db: Session = Depends(get_db)):
             continue
         seen.add(s.id)
         a = att_map.get(s.id)
-        outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
-            Invoice.student_id == sid, Invoice.status != 'cancelled'
-        ).scalar() or 0
+        outstanding, has_invoice = _outstanding_for_subject(db, sid, subject)
         rows.append({"student_id": s.id, "first_name": s.first_name, "last_name": s.last_name,
                      "status": a.status if a else None, "notes": a.notes if a else None,
-                     "outstanding": round(outstanding, 2)})
+                     "outstanding": outstanding, "has_invoice": has_invoice})
     # Include any ad-hoc attendees not in the active roster (e.g. makeups).
     for sid, a in att_map.items():
         if sid in seen:
             continue
         s = db.query(Student).filter(Student.id == sid).first()
         if s:
-            outstanding = db.query(func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
-                Invoice.student_id == sid, Invoice.status != 'cancelled'
-            ).scalar() or 0
+            outstanding, has_invoice = _outstanding_for_subject(db, sid, subject)
             rows.append({"student_id": s.id, "first_name": s.first_name, "last_name": s.last_name,
-                         "status": a.status, "notes": a.notes, "outstanding": round(outstanding, 2)})
+                         "status": a.status, "notes": a.notes, "outstanding": outstanding, "has_invoice": has_invoice})
     return rows
 
 
@@ -4997,18 +5357,35 @@ def scheduling_calendar(
     if room_id:
         q = q.filter(ClassOccurrence.room_id == room_id)
 
-    # Restrict by center/student via the parent template (pre-resolve template ids).
-    if center_id is not None or student_id is not None:
-        tq = db.query(ClassTemplate.id)
-        if center_id is not None:
-            tq = tq.filter(ClassTemplate.center_id == center_id)
-        if student_id is not None:
-            enrolled = [e.template_id for e in db.query(Enrollment).filter(
-                Enrollment.student_id == student_id, Enrollment.status == "active"
-            ).all()]
-            tq = tq.filter(ClassTemplate.id.in_(enrolled or [-1]))
-        allowed = {row[0] for row in tq.all()}
+    # Restrict by center via the parent template (pre-resolve template ids).
+    if center_id is not None:
+        allowed = {row[0] for row in db.query(ClassTemplate.id).filter(ClassTemplate.center_id == center_id).all()}
         q = q.filter(ClassOccurrence.template_id.in_(allowed or [-1]))
+
+    # Restrict to one student's *effective* schedule: baseline template
+    # enrollment (occurrence_id IS NULL) minus any occurrence they were
+    # individually excluded from, plus any occurrence they were individually
+    # included in (e.g. a one-off makeup in a different batch). Matching by
+    # template alone — as this used to — meant a single one-off "include"
+    # override pulled in every other occurrence of that template too, and a
+    # per-occurrence "exclude" was never honored, so a student's calendar
+    # could show classes on days they were never actually rostered for.
+    if student_id is not None:
+        base_tpls = {e.template_id for e in db.query(Enrollment).filter(
+            Enrollment.student_id == student_id, Enrollment.occurrence_id.is_(None),
+            Enrollment.status == "active",
+        ).all()}
+        overrides = db.query(Enrollment).filter(
+            Enrollment.student_id == student_id, Enrollment.occurrence_id.isnot(None),
+        ).all()
+        excl_ids = {e.occurrence_id for e in overrides if e.kind == "exclude"}
+        incl_ids = {e.occurrence_id for e in overrides if e.kind == "include" and e.status == "active"}
+        q = q.filter(
+            or_(
+                and_(ClassOccurrence.template_id.in_(base_tpls or [-1]), ClassOccurrence.id.notin_(excl_ids or [-1])),
+                ClassOccurrence.id.in_(incl_ids or [-1]),
+            )
+        )
 
     occs = q.order_by(ClassOccurrence.date, ClassOccurrence.start_time).all()
 
@@ -5037,6 +5414,19 @@ def scheduling_calendar(
                 d["inc" if e.kind == "include" else "exc"].add(e.student_id)
     stu_map = ({s.id: s for s in db.query(Student).filter(Student.id.in_(stu_ids or [-1])).all()}
                if include_roster else {})
+    # Outstanding scoped per subject, not the student's whole account — a
+    # stray unpaid invoice for an unrelated class shouldn't flag this one.
+    subject_by_tmpl = {tid: (templates[tid].course if templates.get(tid) else None) for tid in template_ids}
+    distinct_subjects = {s for s in subject_by_tmpl.values() if s}
+    outstanding_by_stu_subject = {}   # (student_id, subject) -> amount
+    if include_roster and stu_ids and distinct_subjects:
+        for subj in distinct_subjects:
+            like = f"%{subj}%"
+            for sid, owed in db.query(Invoice.student_id, func.sum(Invoice.total_amount - Invoice.paid_amount)).filter(
+                Invoice.student_id.in_(stu_ids), Invoice.status != 'cancelled',
+                or_(Invoice.payment_type.ilike(like), Invoice.description.ilike(like)),
+            ).group_by(Invoice.student_id).all():
+                outstanding_by_stu_subject[(sid, subj)] = round(owed or 0, 2)
 
     # Per-template occurrence counts → "is this a recurring class?" (>1 occurrence).
     from sqlalchemy import func as _func
@@ -5051,7 +5441,10 @@ def scheduling_calendar(
         ov = overrides_by_occ.get(o.id)
         ids = ((base - ov["exc"]) | ov["inc"]) if ov else base
         if include_roster:
-            return [{"id": s.id, "first_name": s.first_name, "last_name": s.last_name}
+            subj = subject_by_tmpl.get(o.template_id)
+            return [{"id": s.id, "first_name": s.first_name, "last_name": s.last_name,
+                      "outstanding": outstanding_by_stu_subject.get((s.id, subj), 0),
+                      "has_invoice": (s.id, subj) in outstanding_by_stu_subject}
                     for sid in ids for s in [stu_map.get(sid)] if s]
         return len(ids)  # just the count when roster not requested
 
@@ -5069,6 +5462,8 @@ def scheduling_calendar(
         room = rooms.get(o.room_id)
         roster = _roster_for(o)
         enrolled_count = roster if isinstance(roster, int) else len(roster)
+        paid_count = (sum(1 for s in roster if s["has_invoice"] and s["outstanding"] <= 0)
+                      if isinstance(roster, list) else None)
         result.append({
             "id": o.id, "template_id": o.template_id,
             "name": t.name if t else None, "course": t.course if t else None,
@@ -5082,7 +5477,7 @@ def scheduling_calendar(
             "capacity": t.capacity if t else None,
             "enrolled_count": enrolled_count,
             "enrollment_count": enrolled_count,
-            **({"enrolled_students": roster} if include_roster else {}),
+            **({"enrolled_students": roster, "paid_count": paid_count} if include_roster else {}),
             "present_count": present_counts.get(o.id, 0),
             # Compatibility shape so the existing calendar cards/pills render unchanged.
             "batch": {
@@ -5462,6 +5857,29 @@ def list_invoices(status: Optional[str] = None, center_id: Optional[int] = None,
 
 def _money(v):
     return f"₹{float(v or 0):,.2f}"
+
+
+def _outstanding_for_subject(db: Session, student_id: int, subject: Optional[str]):
+    """Outstanding balance scoped to invoices for one subject, not the
+    student's whole account — a stray unpaid invoice for a *different* class
+    shouldn't flag this one as unpaid on the attendance-marking screen.
+    Invoices don't carry a clean subject column, so this matches on the
+    subject name appearing in payment_type/description (how every invoice
+    created via the admin invoice form or a package purchase is labeled,
+    e.g. "Beginner - Grade 2 | Drums | Monthly Package").
+
+    Returns (outstanding, has_invoice). A student with zero invoices for this
+    subject sums to ₹0 outstanding same as a fully-paid one — without
+    has_invoice, both looked identically "paid" even though one was simply
+    never billed. Callers should treat has_invoice=False as not-paid, not as
+    paid-in-full."""
+    q = db.query(Invoice).filter(Invoice.student_id == student_id, Invoice.status != 'cancelled')
+    if subject:
+        like = f"%{subject}%"
+        q = q.filter(or_(Invoice.payment_type.ilike(like), Invoice.description.ilike(like)))
+    invs = q.all()
+    outstanding = round(sum((i.total_amount or 0) - (i.paid_amount or 0) for i in invs), 2)
+    return outstanding, len(invs) > 0
 
 
 def _invoice_detail(db, inv):
@@ -5854,6 +6272,7 @@ async def update_invoice(inv_id: int, request: Request, db: Session = Depends(ge
             setattr(inv, field, body[field])
     if body.get("status") == "paid":
         inv.paid_amount = inv.total_amount
+        _activate_package_for_invoice(db, inv)
     db.commit()
     # Phase 4A: Audit invoice.updated
     audit(db, "invoice.updated", subject=("staff", current["id"]), request=request,
@@ -5975,6 +6394,8 @@ async def record_payment(inv_id: int, request: Request, db: Session = Depends(ge
             ins.paid_amount = round((ins.paid_amount or 0) + amount, 2)
             ins.status = "paid" if ins.paid_amount >= ins.amount else "partial"
     _recompute_invoice_status(inv)
+    if inv.status == "paid":
+        _activate_package_for_invoice(db, inv)
     db.commit()
     db.refresh(inv)
     emailed = _maybe_email_invoice(db, inv, "receipt", body.get("to_email"), bool(body.get("send_receipt")))
@@ -6275,6 +6696,8 @@ async def public_invoice_verify(inv_id: int, request: Request, db: Session = Dep
     inv.paid_amount = round((inv.paid_amount or 0) + balance, 2)
     inv.payment_mode = "Razorpay (online)"
     _recompute_invoice_status(inv)
+    if inv.status == "paid":
+        _activate_package_for_invoice(db, inv)
     db.commit()
     _maybe_email_invoice(db, inv, "receipt", None, True)   # instant receipt
     return {"success": True, "status": inv.status}
