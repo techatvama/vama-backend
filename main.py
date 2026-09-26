@@ -41,7 +41,11 @@ from models import (
 import scheduling
 import crud
 from schemas import StaffCreate
-from auth import router as auth_router, provision_account, email_exists, staff_email_exists, verify_credentials, audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email, roles_for, require_roles
+from auth import (router as auth_router, provision_account, email_exists, staff_email_exists, verify_credentials,
+                   audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email,
+                   roles_for, require_roles, _notif_enabled, _notif_settings, _notif_template, _org_brand,
+                   _branded_email_html, NOTIF_CATEGORIES, NOTIF_CATEGORY_DEFAULTS, NOTIF_TEMPLATE_DEFAULTS,
+                   rate_limiter, _client_ip)
 import security
 import enrollment as _enrollment_module
 
@@ -249,6 +253,12 @@ def _run_migrations():
         "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS description TEXT",
         # ── Grade Manager: description field + full CRUD (was read-only) ──
         "ALTER TABLE grades ADD COLUMN IF NOT EXISTS description TEXT",
+        # ── Curriculum decentralization: syllabi are per-center, not shared ──
+        "ALTER TABLE syllabi ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        # ── Same for the Subject/Grade/Exam-session taxonomy ──
+        "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        "ALTER TABLE grades ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        "ALTER TABLE exam_sessions ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -264,27 +274,10 @@ def _run_migrations():
 
 
 def _seed_defaults():
-    """Seed Grade, Subject, and ExamSession rows if tables are empty."""
+    """Seed Center rows if the table is empty. Grade/Subject/ExamSession are
+    NOT seeded here — each center's curriculum taxonomy starts empty and is
+    built independently per center, same as its syllabus content."""
     with engine.connect() as conn:
-        if conn.execute(text("SELECT COUNT(*) FROM grades")).scalar() == 0:
-            grades = [
-                "Debut", "Grade 1", "Grade 2", "Grade 3",
-                "Grade 4", "Grade 5", "Grade 6", "Grade 7", "Grade 8"
-            ]
-            for i, name in enumerate(grades):
-                conn.execute(
-                    text("INSERT INTO grades (name, display_order) VALUES (:name, :order)"),
-                    {"name": name, "order": i}
-                )
-
-        if conn.execute(text("SELECT COUNT(*) FROM subjects")).scalar() == 0:
-            subjects = ["Piano", "Guitar", "Violin", "Vocals", "Drums", "Keyboard", "Flute", "Tabla"]
-            for name in subjects:
-                conn.execute(
-                    text("INSERT INTO subjects (name, is_active) VALUES (:name, TRUE)"),
-                    {"name": name}
-                )
-
         # Seed centers
         if conn.execute(text("SELECT COUNT(*) FROM centers")).scalar() == 0:
             centers = [
@@ -332,29 +325,8 @@ def _seed_defaults():
         """))
         conn.commit()
 
-    # Seed exam_sessions separately to handle schema variations
-    try:
-        with engine.connect() as conn:
-            count = conn.execute(text("SELECT COUNT(*) FROM exam_sessions")).scalar()
-            if count == 0:
-                exam_sessions_data = [
-                    ("Trinity March 2026", "Trinity", True),
-                    ("Trinity June 2026", "Trinity", True),
-                    ("Trinity December 2026", "Trinity", True),
-                    ("ABRSM April 2026", "ABRSM", True),
-                    ("RSL Summer 2026", "RSL", True),
-                ]
-                for name, board, active in exam_sessions_data:
-                    try:
-                        conn.execute(
-                            text("INSERT INTO exam_sessions (name, exam_board, is_active) VALUES (:name, :board, :active)"),
-                            {"name": name, "board": board, "active": active}
-                        )
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-    except Exception as e:
-        print(f"Exam session seed warning: {e}")
+    # Exam sessions are NOT seeded — same per-center-empty-by-default policy
+    # as Grade/Subject above; each center adds its own exam sittings.
 
 
 def _migrate_scheduling_v2():
@@ -529,6 +501,7 @@ def _seed_payment_config():
 
 @app.post("/student/login")
 async def student_login(request: Request, db: Session = Depends(get_db)):
+    rate_limiter.check(f"login:{_client_ip(request)}", max_hits=10, window_seconds=300)
     body = await request.json()
     email = body.get("email", "").strip().lower()
     password = body.get("password", "")
@@ -591,8 +564,11 @@ async def student_login(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/student/{student_id}/siblings")
-def get_student_siblings(student_id: int, db: Session = Depends(get_db)):
+def get_student_siblings(student_id: int, db: Session = Depends(get_db),
+                         current = Depends(require_roles("student"))):
     """Children linked to the same guardian — powers the parent child-switcher."""
+    if current["id"] != student_id:
+        raise HTTPException(status_code=403, detail="Cannot view another student's siblings")
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
@@ -601,6 +577,7 @@ def get_student_siblings(student_id: int, db: Session = Depends(get_db)):
 
 @app.post("/teacher/login")
 async def teacher_login(request: Request, db: Session = Depends(get_db)):
+    rate_limiter.check(f"login:{_client_ip(request)}", max_hits=10, window_seconds=300)
     body = await request.json()
     email = body.get("email", "").strip().lower()
     password = body.get("password", "")
@@ -776,17 +753,20 @@ def admin_students_overview(center_id: Optional[int] = None, db: Session = Depen
                        .group_by(StudentProgress.student_id).all())
     total_prog = dict(db.query(StudentProgress.student_id, _func.count())
                       .group_by(StudentProgress.student_id).all())
-    # Syllabus content counts keyed by (grade, type) for the canonical denominator.
+    # Syllabus content counts keyed by (center, grade, type) for the canonical
+    # denominator — each center now maintains its own copy of a syllabus, so
+    # the count must come from the student's own center, not whichever
+    # center's row happened to be seen last.
     syll_counts = {}
     try:
         for syl in db.query(Syllabus).all():
-            syll_counts[(syl.grade_name, syl.syllabus_type)] = sum(len(m.contents) for m in syl.modules)
+            syll_counts[(syl.center_id, syl.grade_name, syl.syllabus_type)] = sum(len(m.contents) for m in syl.modules)
     except Exception:
         pass  # syllabus_modules.order column may not yet exist; progress % will fall back to 0
 
     rows = []
     for s in students:
-        total = syll_counts.get((s.current_grade, s.syllabus_type), 0) or total_prog.get(s.id, 0)
+        total = syll_counts.get((s.center_id, s.current_grade, s.syllabus_type), 0) or total_prog.get(s.id, 0)
         done = done_counts.get(s.id, 0)
         rows.append({
             "id": s.id,
@@ -1071,10 +1051,11 @@ async def create_student(request: Request, db: Session = Depends(get_db),
 
     login_email = family_email
 
-    # Center admins automatically assign new students to their center.
+    # Center admins can only ever create a student in their own center —
+    # force it server-side rather than trusting a client-supplied center_id.
     caller = current.get("obj")
     center_id = body.get("center_id")
-    if not center_id and caller and getattr(caller, "access_role", None) == "center_admin":
+    if caller and getattr(caller, "access_role", None) == "center_admin":
         center_id = getattr(caller, "center_id", None)
 
     student = Student(
@@ -1083,6 +1064,7 @@ async def create_student(request: Request, db: Session = Depends(get_db),
         email=login_email,
         guardian_email=(body.get("guardian_email") or "").strip().lower() or family_email,
         primary_phone_number=body.get("primary_phone_number", ""),
+        date_of_birth=body.get("date_of_birth"),
         gender=body.get("gender"),
         address=body.get("address"),
         desired_course=body.get("desired_course"),
@@ -1094,13 +1076,16 @@ async def create_student(request: Request, db: Session = Depends(get_db),
         center_id=center_id,
     )
     db.add(student)
+    db.flush()
     # No default password — provision a pending account + send activation email.
     # Always notify the real family address, even when `email` is a synthetic sibling handle.
     provision_account(db, "student", student, request=request, notify_email=family_email)
-    if any(f in body for f in EXTRA_PROFILE_FIELDS):
+    custom_responses = _extract_custom_responses(db, center_id, body)
+    if any(f in body for f in EXTRA_PROFILE_FIELDS) or custom_responses:
         extra = StudentApplication(
             first_name=student.first_name, last_name=student.last_name, email=student.email,
             status="approved", student_id=student.id,
+            custom_responses=custom_responses,
             **{f: body.get(f) for f in EXTRA_PROFILE_FIELDS if f in body},
         )
         db.add(extra)
@@ -1121,6 +1106,8 @@ async def update_student(student_id: int, request: Request, db: Session = Depend
 
     student = db.query(Student).filter(Student.id == student_id).first()
     if student:
+        if current.get("obj").access_role != "super_admin" and student.center_id != current["obj"].center_id:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's student")
         # Portal / teacher-assigned fields — log grade changes to history
         if "current_grade" in body and body["current_grade"] != student.current_grade:
             old_grade = student.current_grade
@@ -1173,14 +1160,23 @@ async def update_student(student_id: int, request: Request, db: Session = Depend
             student.nearest_vama_center = body.get("nearest_vama_center") or body.get("Nearest_Vama_Center")
         if "preferred_mode_of_contact" in body:
             student.preferred_mode_of_contact = body.get("preferred_mode_of_contact")
+        if "date_of_birth" in body:
+            student.date_of_birth = body.get("date_of_birth") or None
+        if "gender" in body:
+            student.gender = body.get("gender") or None
+        if "address" in body:
+            student.address = body.get("address") or None
 
         # Fields with no column on Student (parent name, city, allergies, etc.) —
         # kept on the linked StudentApplication row so the Student table stays as-is.
-        if any(f in body for f in EXTRA_PROFILE_FIELDS):
+        custom_responses = _extract_custom_responses(db, student.center_id, body)
+        if any(f in body for f in EXTRA_PROFILE_FIELDS) or custom_responses:
             extra = _get_or_create_profile_extra(db, student)
             for f in EXTRA_PROFILE_FIELDS:
                 if f in body:
                     setattr(extra, f, body[f])
+            if custom_responses:
+                extra.custom_responses = custom_responses
 
         db.commit()
         # Phase 4A: Audit student.updated
@@ -1298,6 +1294,8 @@ async def set_student_enrollment_status(student_id: int, request: Request, db: S
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role == "center_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's student")
 
     old_status = student.enrollment_status or "active"
 
@@ -1476,8 +1474,22 @@ async def save_admin_form_config(request: Request, center_id: Optional[int] = No
 # didn't originate from the public form.
 EXTRA_PROFILE_FIELDS = [
     "parent_name", "city", "state", "state_code", "class_frequency",
-    "emergency_contact", "blood_group", "allergies", "referrer",
+    "emergency_contact", "blood_group", "allergies", "referrer", "notes",
 ]
+
+
+def _extract_custom_responses(db: Session, center_id: Optional[int], body: dict) -> Optional[str]:
+    """Pull out any center-defined custom field (key like 'custom_171234...',
+    added via the Form Builder) from a submission/edit body, resolving each
+    one's current label from that center's form config so the value is
+    self-describing wherever it's displayed later (the admin profile page),
+    even if the center later renames/removes the field."""
+    import json as _json
+    custom_keys = [k for k in body if k.startswith("custom_") and body.get(k) not in (None, "")]
+    if not custom_keys:
+        return None
+    label_by_key = {f["key"]: f.get("label", f["key"]) for f in _get_form_config_for_center(center_id, db)}
+    return _json.dumps({k: {"label": label_by_key.get(k, k), "value": body[k]} for k in custom_keys})
 
 
 def _get_or_create_profile_extra(db: Session, student: "Student") -> "StudentApplication":
@@ -1493,7 +1505,19 @@ def _get_or_create_profile_extra(db: Session, student: "Student") -> "StudentApp
 
 
 def _extra_fields_dict(extra: Optional["StudentApplication"]) -> dict:
-    return {f: (getattr(extra, f, None) or "") for f in EXTRA_PROFILE_FIELDS}
+    import json as _json
+    custom_fields = []
+    if extra and extra.custom_responses:
+        try:
+            for k, v in _json.loads(extra.custom_responses).items():
+                if isinstance(v, dict) and v.get("value"):
+                    custom_fields.append({"key": k, "label": v.get("label") or "", "value": v["value"]})
+        except Exception:
+            pass
+    return {
+        **{f: (getattr(extra, f, None) or "") for f in EXTRA_PROFILE_FIELDS},
+        "custom_fields": custom_fields,
+    }
 
 
 def _profile_extras_map(db: Session) -> dict:
@@ -1528,7 +1552,6 @@ STANDARD_APPLICATION_FIELDS = {
 @app.post("/public/student-applications")
 async def submit_student_application(request: Request, db: Session = Depends(get_db)):
     """Public enrollment form — directly creates a Student record with no approval step."""
-    import json as _json
     body = await request.json()
     first_name = (body.get("first_name") or "").strip()
     last_name = (body.get("last_name") or "").strip()
@@ -1536,9 +1559,6 @@ async def submit_student_application(request: Request, db: Session = Depends(get
     primary_phone_number = (body.get("primary_phone_number") or "").strip()
     if not first_name or not last_name or not email or not primary_phone_number:
         raise HTTPException(status_code=400, detail="First name, last name, email, and phone number are required")
-
-    # Collect any custom field responses (keys not in standard fields)
-    custom_responses = {k: v for k, v in body.items() if k not in STANDARD_APPLICATION_FIELDS and v}
 
     # A family's email can already be on a sibling's student account — that's
     # fine and expected. Only a collision with a staff/admin login is blocked.
@@ -1552,6 +1572,10 @@ async def submit_student_application(request: Request, db: Session = Depends(get
         center = db.query(Center).filter(Center.name.ilike(nearest_center)).first()
         if center:
             center_id = center.id
+
+    # Collect any center-defined custom field responses, with labels resolved
+    # from that center's own form config so they're self-describing later.
+    custom_responses = _extract_custom_responses(db, center_id, body)
 
     guardian_email = (body.get("guardian_email") or "").strip().lower() or None
 
@@ -1596,7 +1620,7 @@ async def submit_student_application(request: Request, db: Session = Depends(get
         referrer=body.get("referrer") or None,
         notes=body.get("notes") or None,
         center_id=center_id,
-        custom_responses=_json.dumps(custom_responses) if custom_responses else None,
+        custom_responses=custom_responses,
         status="approved",
         student_id=student.id,
     )
@@ -1658,6 +1682,9 @@ async def approve_student_application(application_id: int, request: Request, db:
     a = db.query(StudentApplication).filter(StudentApplication.id == application_id).first()
     if not a:
         raise HTTPException(status_code=404, detail="Application not found")
+    # Phase 2A: Center admin can only approve their center's applications
+    if current.get("obj").access_role == "center_admin" and a.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Access denied")
     if a.status != "pending":
         raise HTTPException(status_code=400, detail=f"Application is already {a.status}")
     # A family's email can already be on a sibling's student account — that's
@@ -2005,12 +2032,15 @@ def get_student_warnings(student_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/admin/student/{student_id}/complete-profile")
-def get_student_complete_profile(student_id: int, db: Session = Depends(get_db)):
+def get_student_complete_profile(student_id: int, db: Session = Depends(get_db),
+                                 current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Aggregate full student profile: info, enrollments, attendance, payments, progress."""
     from datetime import date as _date
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role != "super_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot view another center's student")
 
     teacher = db.query(Staff).filter(Staff.id == student.teacher_id).first() if student.teacher_id else None
 
@@ -2163,6 +2193,31 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
     att_pct = round((grand_total_attended / grand_total_classes) * 100) if grand_total_classes else 0
     extra = db.query(StudentApplication).filter(StudentApplication.student_id == student_id).first()
 
+    # ── Enrolled subjects — LearningEnrollment is the source of truth for a
+    # student taking more than one instrument (mirrors _build_progress_response
+    # for the student-portal Curriculum page); admins need every subject
+    # visible here too, not just the single legacy desired_course field. ──
+    active_learning_enrolls = db.query(LearningEnrollment).filter(
+        LearningEnrollment.student_id == student_id, LearningEnrollment.status == "active",
+    ).order_by(LearningEnrollment.created_at).all()
+    le_teacher_ids = {e.teacher_id for e in active_learning_enrolls if e.teacher_id}
+    le_teachers_map = {s.id: s for s in db.query(Staff).filter(Staff.id.in_(le_teacher_ids or [-1])).all()}
+    if active_learning_enrolls:
+        enrolled_subjects = [{
+            "subject": e.subject,
+            "grade": e.grade or "Debut",
+            "syllabus_type": e.syllabus_type or "Trinity",
+            "teacher": le_teachers_map[e.teacher_id].name if e.teacher_id in le_teachers_map else None,
+        } for e in active_learning_enrolls]
+    else:
+        fallback_subject = student.instrument or student.desired_course
+        enrolled_subjects = [{
+            "subject": fallback_subject,
+            "grade": student.current_grade or "Debut",
+            "syllabus_type": student.syllabus_type or "Trinity",
+            "teacher": teacher.name if teacher else None,
+        }] if fallback_subject else []
+
     return {
         "id": student.id,
         "first_name": student.first_name,
@@ -2181,7 +2236,9 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db))
         "desired_course": student.desired_course or "",
         "instrument": student.instrument or student.desired_course or "",
         "syllabus_type": student.syllabus_type or "Trinity",
+        "center_id": student.center_id,
         "teacher": {"id": teacher.id, "name": teacher.name} if teacher else None,
+        "enrolled_subjects": enrolled_subjects,
         **_extra_fields_dict(extra),
         "financial": {
             "total_fees": total_fees,
@@ -2249,7 +2306,15 @@ def _build_progress_response(student: Student, db: Session, subject: Optional[st
     syllabus = db.query(Syllabus).filter(
         Syllabus.subject == target_subject,
         Syllabus.grade_name == target_grade,
+        Syllabus.center_id == student.center_id,
     ).first()
+    if not syllabus and student.center_id is None:
+        # Students predating center assignment fall back to the unassigned pool.
+        syllabus = db.query(Syllabus).filter(
+            Syllabus.subject == target_subject,
+            Syllabus.grade_name == target_grade,
+            Syllabus.center_id.is_(None),
+        ).first()
 
     student_data = {
         "id": student.id,
@@ -2376,7 +2441,8 @@ async def update_student_progress(
     next_grade = None
     syllabus = db.query(Syllabus).filter(
         Syllabus.grade_name == student.current_grade,
-        Syllabus.syllabus_type == student.syllabus_type
+        Syllabus.syllabus_type == student.syllabus_type,
+        Syllabus.center_id == student.center_id,
     ).first()
     if syllabus:
         all_content_ids = [c.id for m in syllabus.modules for c in m.contents]
@@ -2388,11 +2454,14 @@ async def update_student_progress(
             ).count()
             syllabus_complete = (done_count == len(all_content_ids))
             if syllabus_complete:
-                # Find the next grade by display_order
-                current_grade_obj = db.query(Grade).filter(Grade.name == student.current_grade).first()
+                # Find the next grade by display_order, within this student's own center's grade list
+                current_grade_obj = db.query(Grade).filter(
+                    Grade.name == student.current_grade, Grade.center_id == student.center_id,
+                ).first()
                 if current_grade_obj:
                     next_grade_obj = db.query(Grade).filter(
-                        Grade.display_order > current_grade_obj.display_order
+                        Grade.display_order > current_grade_obj.display_order,
+                        Grade.center_id == student.center_id,
                     ).order_by(Grade.display_order).first()
                     if next_grade_obj:
                         next_grade = next_grade_obj.name
@@ -2438,6 +2507,8 @@ async def promote_student_grade(
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role != "super_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's student")
 
     old_grade = student.current_grade
     student.current_grade = to_grade
@@ -3002,10 +3073,13 @@ def _student_reschedule(db, student_id, old_id, new_id, is_makeup=True):
 
 
 @app.get("/student/{student_id}/package-status")
-def student_package_status(student_id: int, db: Session = Depends(get_db)):
+def student_package_status(student_id: int, db: Session = Depends(get_db),
+                           current = Depends(require_roles("student"))):
     """Single source of truth for student portal gating.
     Returns can_book, sessions remaining, makeup remaining, expiry, and block reason.
     Admin/teacher routes do NOT call this — only the student portal uses it."""
+    if current["id"] != student_id:
+        raise HTTPException(status_code=403, detail="Cannot view another student's package")
     from datetime import date as _date
     sp = get_active_student_package(db, student_id, persist=True)
     if not sp:
@@ -3068,7 +3142,10 @@ def student_package_status(student_id: int, db: Session = Depends(get_db)):
 
 @app.post("/student/{student_id}/do-reschedule")
 def student_do_reschedule(student_id: int, original_session_id: int, new_session_id: int,
-                          reason: Optional[str] = None, db: Session = Depends(get_db)):
+                          reason: Optional[str] = None, db: Session = Depends(get_db),
+                          current = Depends(require_roles("student"))):
+    if current["id"] != student_id:
+        raise HTTPException(status_code=403, detail="Cannot reschedule another student's class")
     # Gate: student must have an active package with makeup sessions remaining
     new_sess = db.query(ClassOccurrence).filter(ClassOccurrence.id == new_session_id).first()
     assert_can_book(db, student_id, new_sess, count=1, is_makeup=True)
@@ -3076,7 +3153,10 @@ def student_do_reschedule(student_id: int, original_session_id: int, new_session
 
 
 @app.post("/student/{student_id}/reschedule")
-async def student_reschedule(student_id: int, request: Request, db: Session = Depends(get_db)):
+async def student_reschedule(student_id: int, request: Request, db: Session = Depends(get_db),
+                             current = Depends(require_roles("student"))):
+    if current["id"] != student_id:
+        raise HTTPException(status_code=403, detail="Cannot reschedule another student's class")
     body = await request.json()
     old_id = body.get("old_session_id")
     new_id = body.get("new_session_id")
@@ -3086,13 +3166,16 @@ async def student_reschedule(student_id: int, request: Request, db: Session = De
 
 
 @app.post("/student/{student_id}/book")
-async def student_book_extra_class(student_id: int, request: Request, db: Session = Depends(get_db)):
+async def student_book_extra_class(student_id: int, request: Request, db: Session = Depends(get_db),
+                                   current = Depends(require_roles("student"))):
     """Book an extra slot without cancelling anything else — same booking
     engine as reschedule, just with no old_session_id to release. Draws from
     the makeup quota (mirrors reschedule): the regular quota is what the
     student's recurring enrollment already consumes automatically, so a
     self-service 'book an extra class' is the same kind of flexible,
     separately-tracked session a makeup is."""
+    if current["id"] != student_id:
+        raise HTTPException(status_code=403, detail="Cannot book a class for another student")
     body = await request.json()
     new_id = body.get("session_id") or body.get("new_session_id")
     new_sess = db.query(ClassOccurrence).filter(ClassOccurrence.id == new_id).first() if new_id else None
@@ -3112,6 +3195,11 @@ async def admin_student_reschedule(
     behalf (mirrors add_student_scoped, which is admin-only for the same
     reason: student/teacher self-service booking paths hard-block, admin
     paths don't)."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role == "center_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot reschedule another center's student")
     body = await request.json()
     old_id = body.get("old_session_id")
     new_id = body.get("new_session_id")
@@ -3124,12 +3212,16 @@ def calendar_filtered(
     end: Optional[str] = None,
     enrollment_filter: Optional[int] = None,
     center_id: Optional[int] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "staff")),
 ):
     """Return all sessions in a date range, optionally filtered to a student's batches or center.
     Returns the full session shape expected by the Scheduler / TeacherCalendar:
     batch.subject, batch.teacher_id, batch.color_tag, enrolled_students, etc.
-    """
+    (Legacy — superseded by /scheduling/calendar; kept for any lingering callers.)"""
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center
     q = db.query(ClassSession)
     if start:
         q = q.filter(ClassSession.date >= start)
@@ -3233,7 +3325,15 @@ def get_teacher_students(teacher_id: int, db: Session = Depends(get_db)):
 # ==================== Materials ====================
 
 @app.get("/teacher/{teacher_id}/materials")
-def get_teacher_materials(teacher_id: int, db: Session = Depends(get_db)):
+def get_teacher_materials(teacher_id: int, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin", "staff"))):
+    obj = current.get("obj")
+    if obj.access_role == "teacher" and teacher_id != current["id"]:
+        raise HTTPException(status_code=403, detail="Cannot view another teacher's materials")
+    if obj.access_role == "center_admin":
+        target = db.query(Staff).filter(Staff.id == teacher_id).first()
+        if not target or target.center_id != obj.center_id:
+            raise HTTPException(status_code=403, detail="Cannot view another center's teacher")
     materials = (
         db.query(Material)
         .filter(Material.uploaded_by == teacher_id)
@@ -3253,6 +3353,14 @@ def get_teacher_materials(teacher_id: int, db: Session = Depends(get_db)):
     ]
 
 
+_MATERIAL_EXT_TO_TYPE = {
+    ".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".gif": "image", ".webp": "image", ".mp3": "audio", ".wav": "audio",
+    ".m4a": "audio", ".mp4": "video", ".mov": "video", ".mkv": "video",
+}
+_MATERIAL_MAX_BYTES = 50 * 1024 * 1024  # 50MB
+
+
 @app.post("/teacher/upload-material")
 async def teacher_upload_material(
     teacher_id: int = Form(...),
@@ -3260,19 +3368,29 @@ async def teacher_upload_material(
     student_ids: str = Form(default=""),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "staff")),
 ):
     import uuid, os
+    obj = current.get("obj")
+    # A plain teacher can only upload as themselves — the field can't be
+    # trusted to pick who else's materials list this lands in.
+    if obj.access_role == "teacher":
+        teacher_id = current["id"]
+    elif obj.access_role == "center_admin":
+        target = db.query(Staff).filter(Staff.id == teacher_id).first()
+        if not target or target.center_id != obj.center_id:
+            raise HTTPException(status_code=403, detail="Cannot upload as another center's teacher")
+
     ext = os.path.splitext(file.filename or "")[1].lower()
-    ext_to_type = {
-        ".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image",
-        ".gif": "image", ".webp": "image", ".mp3": "audio", ".wav": "audio",
-        ".m4a": "audio", ".mp4": "video", ".mov": "video", ".mkv": "video",
-    }
-    file_type = ext_to_type.get(ext, "file")
+    if ext not in _MATERIAL_EXT_TO_TYPE:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
+    file_type = _MATERIAL_EXT_TO_TYPE[ext]
+    contents = await file.read()
+    if len(contents) > _MATERIAL_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 50MB)")
     filename = f"{uuid.uuid4().hex}{ext}"
     save_dir = "static/materials"
     _osmod.makedirs(save_dir, exist_ok=True)
-    contents = await file.read()
     with open(f"{save_dir}/{filename}", "wb") as f:
         f.write(contents)
     url = f"/static/materials/{filename}"
@@ -3344,22 +3462,35 @@ def _grade_dict(g: "Grade") -> dict:
 
 
 @app.get("/admin/grades")
-def get_grades(db: Session = Depends(get_db)):
-    grades = db.query(Grade).order_by(Grade.display_order).all()
+def get_grades(center_id: Optional[int] = None, db: Session = Depends(get_db),
+               current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+    own_center = _caller_center_id(current)
+    q = db.query(Grade)
+    if own_center is not None:
+        q = q.filter(Grade.center_id == own_center)
+    elif center_id:
+        q = q.filter(Grade.center_id == center_id)
+    grades = q.order_by(Grade.display_order).all()
     return [_grade_dict(g) for g in grades]
 
 
 @app.post("/admin/grades")
-async def create_grade(request: Request, db: Session = Depends(get_db)):
+async def create_grade(request: Request, db: Session = Depends(get_db),
+                       current = Depends(require_roles("super_admin", "center_admin"))):
     from sqlalchemy.exc import IntegrityError
     body = await request.json()
     if not body.get("name"):
         raise HTTPException(status_code=400, detail="name is required")
+    own_center = _caller_center_id(current)
+    target_center_id = own_center if own_center is not None else body.get("center_id")
+    if not target_center_id:
+        raise HTTPException(status_code=400, detail="center_id is required")
     grade = Grade(
         name=body["name"],
         level=body.get("level", 0),
         display_order=body.get("level", 0),
         description=body.get("description") or None,
+        center_id=target_center_id,
     )
     db.add(grade)
     try:
@@ -3372,12 +3503,16 @@ async def create_grade(request: Request, db: Session = Depends(get_db)):
 
 
 @app.put("/admin/grades/{grade_id}")
-async def update_grade(grade_id: int, request: Request, db: Session = Depends(get_db)):
+async def update_grade(grade_id: int, request: Request, db: Session = Depends(get_db),
+                       current = Depends(require_roles("super_admin", "center_admin"))):
     from sqlalchemy.exc import IntegrityError
     body = await request.json()
     grade = db.query(Grade).filter(Grade.id == grade_id).first()
     if not grade:
         raise HTTPException(status_code=404, detail="Grade not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and grade.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's grade list")
     if "name" in body:
         grade.name = body["name"]
     if "level" in body:
@@ -3395,10 +3530,14 @@ async def update_grade(grade_id: int, request: Request, db: Session = Depends(ge
 
 
 @app.delete("/admin/grades/{grade_id}")
-def delete_grade(grade_id: int, db: Session = Depends(get_db)):
+def delete_grade(grade_id: int, db: Session = Depends(get_db),
+                 current = Depends(require_roles("super_admin", "center_admin"))):
     grade = db.query(Grade).filter(Grade.id == grade_id).first()
     if not grade:
         raise HTTPException(status_code=404, detail="Grade not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and grade.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's grade list")
     db.delete(grade)
     db.commit()
     return {"success": True}
@@ -3409,23 +3548,46 @@ def _subject_dict(s: "Subject") -> dict:
 
 
 @app.get("/admin/subjects")
-def get_subjects(include_inactive: bool = False, db: Session = Depends(get_db)):
+def get_subjects(include_inactive: bool = False, center_id: Optional[int] = None,
+                 db: Session = Depends(get_db),
+                 current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+    own_center = _caller_center_id(current)
     query = db.query(Subject)
+    if own_center is not None:
+        query = query.filter(Subject.center_id == own_center)
+    elif center_id:
+        query = query.filter(Subject.center_id == center_id)
     if not include_inactive:
         query = query.filter(Subject.is_active == True)
     subjects = query.order_by(Subject.name).all()
     return [_subject_dict(s) for s in subjects]
 
 
+@app.get("/public/subjects")
+def get_public_subjects(center_id: int, db: Session = Depends(get_db)):
+    """Unauthenticated — feeds the public application form's course picker
+    for the center a prospective student is applying to."""
+    subjects = (db.query(Subject)
+                .filter(Subject.center_id == center_id, Subject.is_active == True)
+                .order_by(Subject.name).all())
+    return [_subject_dict(s) for s in subjects]
+
+
 @app.post("/admin/subjects")
-async def create_subject(request: Request, db: Session = Depends(get_db)):
+async def create_subject(request: Request, db: Session = Depends(get_db),
+                         current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     if not body.get("name"):
         raise HTTPException(status_code=400, detail="name is required")
+    own_center = _caller_center_id(current)
+    target_center_id = own_center if own_center is not None else body.get("center_id")
+    if not target_center_id:
+        raise HTTPException(status_code=400, detail="center_id is required")
     subject = Subject(
         name=body["name"],
         description=body.get("description") or None,
         is_active=body.get("is_active", True),
+        center_id=target_center_id,
     )
     db.add(subject)
     db.commit()
@@ -3434,11 +3596,15 @@ async def create_subject(request: Request, db: Session = Depends(get_db)):
 
 
 @app.put("/admin/subjects/{subject_id}")
-async def update_subject(subject_id: int, request: Request, db: Session = Depends(get_db)):
+async def update_subject(subject_id: int, request: Request, db: Session = Depends(get_db),
+                         current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and subject.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's subject list")
     if "name" in body:
         subject.name = body["name"]
     if "description" in body:
@@ -3451,10 +3617,14 @@ async def update_subject(subject_id: int, request: Request, db: Session = Depend
 
 
 @app.delete("/admin/subjects/{subject_id}")
-def delete_subject(subject_id: int, db: Session = Depends(get_db)):
+def delete_subject(subject_id: int, db: Session = Depends(get_db),
+                   current = Depends(require_roles("super_admin", "center_admin"))):
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and subject.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's subject list")
     db.delete(subject)
     db.commit()
     return {"success": True}
@@ -3469,21 +3639,34 @@ def _exam_session_dict(e: "ExamSession") -> dict:
 
 
 @app.get("/admin/exam-sessions")
-def get_exam_sessions(db: Session = Depends(get_db)):
-    sessions = db.query(ExamSession).order_by(ExamSession.exam_date.is_(None), ExamSession.exam_date).all()
+def get_exam_sessions(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                      current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+    own_center = _caller_center_id(current)
+    q = db.query(ExamSession)
+    if own_center is not None:
+        q = q.filter(ExamSession.center_id == own_center)
+    elif center_id:
+        q = q.filter(ExamSession.center_id == center_id)
+    sessions = q.order_by(ExamSession.exam_date.is_(None), ExamSession.exam_date).all()
     return [_exam_session_dict(e) for e in sessions]
 
 
 @app.post("/admin/exam-sessions")
-async def create_exam_session(request: Request, db: Session = Depends(get_db)):
+async def create_exam_session(request: Request, db: Session = Depends(get_db),
+                              current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     if not body.get("name") or not body.get("exam_board"):
         raise HTTPException(status_code=400, detail="name and exam_board are required")
+    own_center = _caller_center_id(current)
+    target_center_id = own_center if own_center is not None else body.get("center_id")
+    if not target_center_id:
+        raise HTTPException(status_code=400, detail="center_id is required")
     session = ExamSession(
         name=body["name"],
         exam_board=body["exam_board"],
         exam_date=body.get("exam_date") or None,
         is_active=body.get("is_active", True),
+        center_id=target_center_id,
     )
     db.add(session)
     db.commit()
@@ -3492,11 +3675,15 @@ async def create_exam_session(request: Request, db: Session = Depends(get_db)):
 
 
 @app.put("/admin/exam-sessions/{session_id}")
-async def update_exam_session(session_id: int, request: Request, db: Session = Depends(get_db)):
+async def update_exam_session(session_id: int, request: Request, db: Session = Depends(get_db),
+                              current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Exam session not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and session.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's exam sessions")
     if "name" in body:
         session.name = body["name"]
     if "exam_board" in body:
@@ -3511,10 +3698,14 @@ async def update_exam_session(session_id: int, request: Request, db: Session = D
 
 
 @app.delete("/admin/exam-sessions/{session_id}")
-def delete_exam_session(session_id: int, db: Session = Depends(get_db)):
+def delete_exam_session(session_id: int, db: Session = Depends(get_db),
+                        current = Depends(require_roles("super_admin", "center_admin"))):
     session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Exam session not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and session.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's exam sessions")
     db.query(LearningEnrollment).filter(LearningEnrollment.exam_session_id == session_id).update(
         {"exam_session_id": None}, synchronize_session=False
     )
@@ -3542,18 +3733,37 @@ def admin_dashboard_stats(
         teacher_ids = {s.id for s in teacher_q.all()}
         assign_q = assign_q.filter(StudentInstructor.teacher_id.in_(teacher_ids or [-1]))
 
+    subject_q = db.query(Subject).filter(Subject.is_active == True)
+    grade_q = db.query(Grade)
+    exam_q = db.query(ExamSession).filter(ExamSession.is_active == True)
+    syllabus_q = db.query(Syllabus)
+    if center_id:
+        subject_q = subject_q.filter(Subject.center_id == center_id)
+        grade_q = grade_q.filter(Grade.center_id == center_id)
+        exam_q = exam_q.filter(ExamSession.center_id == center_id)
+        syllabus_q = syllabus_q.filter(Syllabus.center_id == center_id)
+
     return {
-        "total_subjects": db.query(Subject).filter(Subject.is_active == True).count(),
-        "total_grades": db.query(Grade).count(),
-        "active_exams": db.query(ExamSession).filter(ExamSession.is_active == True).count(),
+        "total_subjects": subject_q.count(),
+        "total_grades": grade_q.count(),
+        "active_exams": exam_q.count(),
         "total_teachers": teacher_q.count(),
         "total_students": student_q.count(),
         "teacher_assignments": assign_q.count(),
-        "total_syllabi": db.query(Syllabus).count(),
+        "total_syllabi": syllabus_q.count(),
     }
 
 
 # ==================== Syllabus Admin ====================
+
+def _caller_center_id(current: dict) -> Optional[int]:
+    """None means unrestricted (super_admin); otherwise the one center every
+    curriculum read/write this caller makes must be confined to."""
+    obj = current.get("obj")
+    if getattr(obj, "access_role", None) == "super_admin":
+        return None
+    return getattr(obj, "center_id", None)
+
 
 def _syllabus_full(s: Syllabus):
     return {
@@ -3576,9 +3786,16 @@ def _syllabus_full(s: Syllabus):
 def list_syllabi(
     subject_id: Optional[int] = None,
     grade_id: Optional[int] = None,
+    center_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "teacher")),
 ):
+    own_center = _caller_center_id(current)
     q = db.query(Syllabus)
+    if own_center is not None:
+        q = q.filter(Syllabus.center_id == own_center)   # center_admin/teacher: locked to their own center, client-supplied center_id ignored
+    elif center_id:
+        q = q.filter(Syllabus.center_id == center_id)     # super_admin may optionally scope the view
     if subject_id:
         subj = db.query(Subject).filter(Subject.id == subject_id).first()
         if subj:
@@ -3590,22 +3807,34 @@ def list_syllabi(
     q = q.order_by(Syllabus.id)
     return [
         {"id": s.id, "name": s.name, "subject": s.subject,
-         "grade_name": s.grade_name, "syllabus_type": s.syllabus_type}
+         "grade_name": s.grade_name, "syllabus_type": s.syllabus_type, "center_id": s.center_id}
         for s in q.all()
     ]
 
 
 @app.get("/admin/syllabi/{syllabus_id}")
-def get_syllabus(syllabus_id: int, db: Session = Depends(get_db)):
+def get_syllabus(syllabus_id: int, db: Session = Depends(get_db),
+                 current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
     s = db.query(Syllabus).filter(Syllabus.id == syllabus_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Syllabus not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and s.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot view another center's curriculum")
     return _syllabus_full(s)
 
 
 @app.post("/admin/syllabi")
-async def create_syllabus(request: Request, db: Session = Depends(get_db)):
+async def create_syllabus(request: Request, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
+    own_center = _caller_center_id(current)
+    # center_admin can only ever create in their own center; a client-supplied
+    # center_id is honored only for super_admin.
+    target_center_id = own_center if own_center is not None else body.get("center_id")
+    if not target_center_id:
+        raise HTTPException(status_code=400, detail="center_id is required")
+
     # Accept both ID-based (from builder) and name-based references
     subject_name = body.get("subject")
     grade_name = body.get("grade_name")
@@ -3621,14 +3850,15 @@ async def create_syllabus(request: Request, db: Session = Depends(get_db)):
     if not subject_name or not grade_name:
         raise HTTPException(status_code=400, detail="A valid subject and grade are required")
 
-    # Idempotent: a subject+grade combination should have exactly one syllabus.
-    # Returning the existing one (instead of creating another) is what stops
-    # duplicates from piling up when the builder's "Create Syllabus" button
-    # gets clicked more than once for the same combination.
+    # Idempotent: a subject+grade combination should have exactly one syllabus
+    # PER CENTER. Returning the existing one (instead of creating another) is
+    # what stops duplicates from piling up when the builder's "Create
+    # Syllabus" button gets clicked more than once for the same combination.
     if subject_name and grade_name:
         existing = (
             db.query(Syllabus)
-            .filter(Syllabus.subject == subject_name, Syllabus.grade_name == grade_name)
+            .filter(Syllabus.subject == subject_name, Syllabus.grade_name == grade_name,
+                    Syllabus.center_id == target_center_id)
             .order_by(Syllabus.id)
             .first()
         )
@@ -3640,6 +3870,7 @@ async def create_syllabus(request: Request, db: Session = Depends(get_db)):
         subject=subject_name,
         grade_name=grade_name,
         syllabus_type=body.get("syllabus_type"),
+        center_id=target_center_id,
     )
     db.add(syllabus)
     db.commit()
@@ -3667,11 +3898,15 @@ async def create_syllabus(request: Request, db: Session = Depends(get_db)):
 
 
 @app.delete("/admin/syllabi/{syllabus_id}")
-def delete_syllabus(syllabus_id: int, db: Session = Depends(get_db)):
+def delete_syllabus(syllabus_id: int, db: Session = Depends(get_db),
+                    current = Depends(require_roles("super_admin", "center_admin"))):
     from models import StudentProgress as _SP
     s = db.query(Syllabus).filter(Syllabus.id == syllabus_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Syllabus not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and s.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot delete another center's curriculum")
     # Query bare ids (not ORM objects) so the relationship walk above never
     # pulls rows into the session's identity map — mixing that with the raw
     # bulk .delete() calls below raises a spurious StaleDataError otherwise.
@@ -3690,11 +3925,16 @@ def delete_syllabus(syllabus_id: int, db: Session = Depends(get_db)):
 # ── Syllabus Modules ──────────────────────────────────────────────────────────
 
 @app.post("/admin/modules")
-async def create_module(request: Request, db: Session = Depends(get_db)):
+async def create_module(request: Request, db: Session = Depends(get_db),
+                        current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     syllabus_id = body.get("syllabus_id")
-    if not syllabus_id or not db.query(Syllabus).filter(Syllabus.id == syllabus_id).first():
+    syl = db.query(Syllabus).filter(Syllabus.id == syllabus_id).first() if syllabus_id else None
+    if not syl:
         raise HTTPException(status_code=404, detail="Syllabus not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and syl.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's curriculum")
     last = db.query(SyllabusModule).filter(SyllabusModule.syllabus_id == syllabus_id).count()
     m = SyllabusModule(
         syllabus_id=syllabus_id,
@@ -3709,11 +3949,17 @@ async def create_module(request: Request, db: Session = Depends(get_db)):
 
 
 @app.put("/admin/modules/{module_id}")
-async def update_module(module_id: int, request: Request, db: Session = Depends(get_db)):
+async def update_module(module_id: int, request: Request, db: Session = Depends(get_db),
+                        current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     m = db.query(SyllabusModule).filter(SyllabusModule.id == module_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Module not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        syl = db.query(Syllabus).filter(Syllabus.id == m.syllabus_id).first()
+        if not syl or syl.center_id != own_center:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's curriculum")
     if "name" in body:
         m.name = body["name"]
     if "weight" in body:
@@ -3725,11 +3971,17 @@ async def update_module(module_id: int, request: Request, db: Session = Depends(
 
 
 @app.delete("/admin/modules/{module_id}")
-def delete_module(module_id: int, db: Session = Depends(get_db)):
+def delete_module(module_id: int, db: Session = Depends(get_db),
+                  current = Depends(require_roles("super_admin", "center_admin"))):
     from models import StudentProgress as _SP
     m = db.query(SyllabusModule).filter(SyllabusModule.id == module_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Module not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        syl = db.query(Syllabus).filter(Syllabus.id == m.syllabus_id).first()
+        if not syl or syl.center_id != own_center:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's curriculum")
     content_ids = [r[0] for r in db.query(SyllabusContent.id).filter(SyllabusContent.module_id == module_id).all()]
     if content_ids:
         db.query(_SP).filter(_SP.content_id.in_(content_ids)).delete(synchronize_session=False)
@@ -3742,11 +3994,18 @@ def delete_module(module_id: int, db: Session = Depends(get_db)):
 # ── Syllabus Contents ─────────────────────────────────────────────────────────
 
 @app.post("/admin/contents")
-async def create_content(request: Request, db: Session = Depends(get_db)):
+async def create_content(request: Request, db: Session = Depends(get_db),
+                         current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     module_id = body.get("module_id")
-    if not module_id or not db.query(SyllabusModule).filter(SyllabusModule.id == module_id).first():
+    m = db.query(SyllabusModule).filter(SyllabusModule.id == module_id).first() if module_id else None
+    if not m:
         raise HTTPException(status_code=404, detail="Module not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        syl = db.query(Syllabus).filter(Syllabus.id == m.syllabus_id).first()
+        if not syl or syl.center_id != own_center:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's curriculum")
     c = SyllabusContent(
         module_id=module_id,
         name=body.get("name", ""),
@@ -3760,11 +4019,18 @@ async def create_content(request: Request, db: Session = Depends(get_db)):
 
 
 @app.put("/admin/contents/{content_id}")
-async def update_content(content_id: int, request: Request, db: Session = Depends(get_db)):
+async def update_content(content_id: int, request: Request, db: Session = Depends(get_db),
+                         current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     c = db.query(SyllabusContent).filter(SyllabusContent.id == content_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="Content not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        m = db.query(SyllabusModule).filter(SyllabusModule.id == c.module_id).first()
+        syl = db.query(Syllabus).filter(Syllabus.id == m.syllabus_id).first() if m else None
+        if not syl or syl.center_id != own_center:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's curriculum")
     if "name" in body:
         c.name = body["name"]
     if "content_type" in body:
@@ -3776,10 +4042,17 @@ async def update_content(content_id: int, request: Request, db: Session = Depend
 
 
 @app.delete("/admin/contents/{content_id}")
-def delete_content(content_id: int, db: Session = Depends(get_db)):
+def delete_content(content_id: int, db: Session = Depends(get_db),
+                   current = Depends(require_roles("super_admin", "center_admin"))):
     c = db.query(SyllabusContent).filter(SyllabusContent.id == content_id).first()
     if not c:
         raise HTTPException(status_code=404, detail="Content not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        m = db.query(SyllabusModule).filter(SyllabusModule.id == c.module_id).first()
+        syl = db.query(Syllabus).filter(Syllabus.id == m.syllabus_id).first() if m else None
+        if not syl or syl.center_id != own_center:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's curriculum")
     # Remove progress records that reference this content before deleting
     from models import StudentProgress as _SP
     db.query(_SP).filter(_SP.content_id == content_id).delete()
@@ -3978,20 +4251,24 @@ async def create_session(request: Request, db: Session = Depends(get_db),
 
 
 @app.get("/sessions/{session_id}")
-def get_session(session_id: int, db: Session = Depends(get_db)):
+def get_session(session_id: int, db: Session = Depends(get_db),
+               current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Single session with batch/teacher info — used by the session details page."""
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if sess:
+        _check_scheduling_access(current, _session_center_id(sess))
         return _session_to_dict(sess, db)
     # Fall back to scheduling v2 ClassOccurrence (IDs returned by /teacher/{id}/sessions)
     occ = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
     if not occ:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(occ))
     return _occ_session_shape(db, occ)
 
 
 @app.get("/sessions/{session_id}/students")
-def get_session_students(session_id: int, db: Session = Depends(get_db)):
+def get_session_students(session_id: int, db: Session = Depends(get_db),
+                         current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Return all students for this session, including their attendance status."""
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
@@ -3999,6 +4276,7 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
         occ = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
         if not occ:
             raise HTTPException(status_code=404, detail="Session not found")
+        _check_scheduling_access(current, _session_center_id(occ))
 
         # Build roster from Enrollment table (baseline − excludes ∪ includes)
         base_ids = _baseline_ids(db, occ.template_id)
@@ -4029,6 +4307,7 @@ def get_session_students(session_id: int, db: Session = Depends(get_db)):
             })
         return result
 
+    _check_scheduling_access(current, _session_center_id(sess))
     subject = sess.batch.subject if sess.batch else None
     students_map = {s.id: s for s in db.query(Student).all()}
     result = []
@@ -4057,13 +4336,15 @@ def enroll_student_in_session(
     session_id: int,
     student_id: int,
     enrollment_type: str = "single_session",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "staff")),
 ):
     from datetime import datetime as _dt
 
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
     if not db.query(Student).filter(Student.id == student_id).first():
         raise HTTPException(status_code=404, detail="Student not found")
 
@@ -4141,13 +4422,15 @@ def enroll_student_in_session(
 def remove_student_from_session(
     session_id: int, student_id: int,
     scope: str = "this_class",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "staff")),
 ):
     from datetime import datetime as _dt
 
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
 
     if scope == "all_classes" and sess.batch_id:
         # Remove from all sessions in this batch that share the same weekday + time
@@ -4190,7 +4473,8 @@ def mark_attendance(
     notes: Optional[str] = None,
     require_feedback: bool = False,
     bypass_package: bool = False,   # True for teacher/admin — skips package quota check
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "staff")),
 ):
     if require_feedback and status == "present" and not notes:
         raise HTTPException(status_code=400, detail="Feedback/notes are required before marking present")
@@ -4208,6 +4492,7 @@ def mark_attendance(
     if not session:
         occ_for_makeup = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
         session = occ_for_makeup
+    _check_scheduling_access(current, _session_center_id(session))
 
     # Enforce the package guard only when this mark newly consumes a session
     # (going to 'present' from absent/unmarked). bypass_package=True lets
@@ -4241,12 +4526,15 @@ def mark_attendance(
 def student_cancel_session(
     student_id: int, session_id: int,
     reason: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current = Depends(require_roles("student")),
 ):
     """Student cancels their own attendance for an occurrence.
     Checks the cancellation window from the student's active package.
     Marks attendance as 'student_cancelled' — does NOT cancel the occurrence itself.
     """
+    if current["id"] != student_id:
+        raise HTTPException(status_code=403, detail="Cannot cancel another student's class")
     from datetime import datetime as _dt
     occ = db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
     if not occ:
@@ -4297,30 +4585,36 @@ def student_cancel_session(
 
 
 @app.put("/sessions/{session_id}/publish")
-def toggle_session_publish(session_id: int, db: Session = Depends(get_db)):
+def toggle_session_publish(session_id: int, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin"))):
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
     sess.is_published = not (sess.is_published if sess.is_published is not None else True)
     db.commit()
     return {"is_published": sess.is_published}
 
 
 @app.put("/sessions/{session_id}/cancel")
-def cancel_session(session_id: int, db: Session = Depends(get_db)):
+def cancel_session(session_id: int, db: Session = Depends(get_db),
+                   current = Depends(require_roles("super_admin", "center_admin"))):
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
     sess.status = "cancelled"
     db.commit()
     return {"status": "cancelled"}
 
 
 @app.delete("/sessions/{session_id}")
-def delete_session(session_id: int, db: Session = Depends(get_db)):
+def delete_session(session_id: int, db: Session = Depends(get_db),
+                   current = Depends(require_roles("super_admin", "center_admin"))):
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
     db.query(Attendance).filter(Attendance.session_id == session_id).delete()
     db.delete(sess)
     db.commit()
@@ -4328,11 +4622,13 @@ def delete_session(session_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/sessions/{session_id}/series")
-def get_session_series(session_id: int, db: Session = Depends(get_db)):
+def get_session_series(session_id: int, db: Session = Depends(get_db),
+                       current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Return all sessions in the same batch (series) on or after this session's date."""
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
     if not sess.batch_id:
         return [{"id": sess.id, "date": sess.date, "start_time": sess.start_time, "end_time": sess.end_time}]
     sessions = db.query(ClassSession).filter(
@@ -4343,12 +4639,14 @@ def get_session_series(session_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/sessions/{session_id}/update-future")
-async def update_future_sessions(session_id: int, request: Request, db: Session = Depends(get_db)):
+async def update_future_sessions(session_id: int, request: Request, db: Session = Depends(get_db),
+                                current = Depends(require_roles("super_admin", "center_admin"))):
     """Update start/end time for all sessions in the same batch on or after this session's date."""
     body = await request.json()
     sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
+    _check_scheduling_access(current, _session_center_id(sess))
     query = db.query(ClassSession).filter(ClassSession.id == session_id)
     if sess.batch_id:
         query = db.query(ClassSession).filter(
@@ -4462,6 +4760,40 @@ def _occurrence_dict(db, o: ClassOccurrence):
         "capacity": t.capacity if t else None,
         "present_count": present, "notes": o.notes, "is_published": o.is_published,
     }
+
+
+def _session_center_id(session_obj) -> Optional[int]:
+    """center_id for either a legacy ClassSession (via its Batch) or a v2
+    ClassOccurrence (via its ClassTemplate) — the two session-shaped things
+    the /sessions/* legacy endpoints resolve against."""
+    if session_obj is None:
+        return None
+    if hasattr(session_obj, "batch"):          # ClassSession
+        return session_obj.batch.center_id if session_obj.batch else None
+    if hasattr(session_obj, "template"):        # ClassOccurrence
+        return session_obj.template.center_id if session_obj.template else None
+    return None
+
+
+def _resolve_session_or_occurrence(db, session_id: int):
+    """A /sessions/{id} path may address a legacy ClassSession or a v2
+    ClassOccurrence (ids are shared/mirrored) — resolve whichever exists."""
+    sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
+    if sess:
+        return sess
+    return db.query(ClassOccurrence).filter(ClassOccurrence.id == session_id).first()
+
+
+def _check_scheduling_access(current: dict, resource_center_id: Optional[int]):
+    """Raise 403 if this caller (center_admin/teacher) doesn't own the center
+    a scheduling resource (template/occurrence) belongs to. super_admin is
+    unrestricted; a template/occurrence with no center_id (legacy data) is
+    left accessible rather than blocking everyone."""
+    obj = current.get("obj")
+    if getattr(obj, "access_role", None) == "super_admin":
+        return
+    if resource_center_id is not None and resource_center_id != getattr(obj, "center_id", None):
+        raise HTTPException(status_code=403, detail="Cannot access another center's class")
 
 
 def _apply_edits(obj, edits):
@@ -4866,10 +5198,12 @@ def list_templates(center_id: Optional[int] = None, page: Optional[int] = None, 
 
 
 @app.get("/scheduling/templates/{template_id}")
-def get_template(template_id: int, db: Session = Depends(get_db)):
+def get_template(template_id: int, db: Session = Depends(get_db),
+                current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     t = db.query(ClassTemplate).filter(ClassTemplate.id == template_id).first()
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
+    _check_scheduling_access(current, t.center_id)
     return _template_dict(db, t)
 
 
@@ -4955,11 +5289,13 @@ async def update_template(template_id: int, request: Request, db: Session = Depe
 
 
 @app.post("/scheduling/templates/{template_id}/regenerate")
-def regenerate_template(template_id: int, db: Session = Depends(get_db)):
+def regenerate_template(template_id: int, db: Session = Depends(get_db),
+                        current = Depends(require_roles("super_admin", "center_admin"))):
     """Top up future occurrences up to the rolling horizon (for open-ended series)."""
     t = db.query(ClassTemplate).filter(ClassTemplate.id == template_id).first()
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
+    _check_scheduling_access(current, t.center_id)
     created = scheduling.generate_for_template(db, t, from_date=_d.today().isoformat())
     db.commit()
     return {"occurrences_created": created}
@@ -4968,15 +5304,18 @@ def regenerate_template(template_id: int, db: Session = Depends(get_db)):
 # ── Occurrences + 3-tier edits ──
 
 @app.get("/scheduling/occurrences/{occ_id}")
-def get_occurrence(occ_id: int, db: Session = Depends(get_db)):
+def get_occurrence(occ_id: int, db: Session = Depends(get_db),
+                   current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     return _occurrence_dict(db, o)
 
 
 @app.put("/scheduling/occurrences/{occ_id}")
-async def edit_occurrence(occ_id: int, request: Request, db: Session = Depends(get_db)):
+async def edit_occurrence(occ_id: int, request: Request, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin"))):
     """3-tier edit. body: {scope, start_time?, end_time?, teacher_id?, room_id?}."""
     body = await request.json()
     scope = body.get("scope", "this")
@@ -4985,6 +5324,7 @@ async def edit_occurrence(occ_id: int, request: Request, db: Session = Depends(g
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     edits = {f: body[f] for f in _EDIT_FIELDS if f in body}
     _validate_times(edits.get("start_time", o.start_time), edits.get("end_time", o.end_time))
     t = o.template
@@ -5013,13 +5353,15 @@ async def edit_occurrence(occ_id: int, request: Request, db: Session = Depends(g
 
 
 @app.post("/scheduling/occurrences/{occ_id}/cancel")
-async def cancel_occurrence(occ_id: int, request: Request, db: Session = Depends(get_db)):
+async def cancel_occurrence(occ_id: int, request: Request, db: Session = Depends(get_db),
+                            current = Depends(require_roles("super_admin", "center_admin"))):
     """Cancel occurrence(s). Attendance is preserved. body: {scope}."""
     body = await request.json() if await request.body() else {}
     scope = (body or {}).get("scope", "this")
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     if scope == "this":
         o.status = "cancelled"
         o.is_modified = True
@@ -5039,7 +5381,8 @@ async def cancel_occurrence(occ_id: int, request: Request, db: Session = Depends
 
 
 @app.delete("/scheduling/occurrences/{occ_id}")
-def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(get_db)):
+def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(get_db),
+                      current = Depends(require_roles("super_admin", "center_admin"))):
     """Permanently delete occurrence(s). scope:
        this            → just this occurrence (+ its attendance)
        this_and_future → this + all later occurrences in the SAME weekday stream;
@@ -5052,6 +5395,7 @@ def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(ge
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
 
     template = o.template
     rule = template.rule if template else None
@@ -5105,12 +5449,14 @@ def delete_occurrence(occ_id: int, scope: str = "this", db: Session = Depends(ge
 # ── Enrollment (template-level, capacity-checked) ──
 
 @app.post("/scheduling/templates/{template_id}/enroll")
-async def enroll_in_template(template_id: int, request: Request, db: Session = Depends(get_db)):
+async def enroll_in_template(template_id: int, request: Request, db: Session = Depends(get_db),
+                             current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
     student_id = body.get("student_id")
     t = db.query(ClassTemplate).filter(ClassTemplate.id == template_id).first()
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
+    _check_scheduling_access(current, t.center_id)
     if not db.query(Student).filter(Student.id == student_id).first():
         raise HTTPException(status_code=404, detail="Student not found")
     existing = db.query(Enrollment).filter(
@@ -5171,6 +5517,7 @@ async def add_student_scoped(
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     if not db.query(Student).filter(Student.id == student_id).first():
         raise HTTPException(status_code=404, detail="Student not found")
     base = _baseline_ids(db, o.template_id)
@@ -5205,7 +5552,8 @@ async def add_student_scoped(
 
 
 @app.post("/scheduling/occurrences/{occ_id}/remove-student")
-async def remove_student_scoped(occ_id: int, request: Request, db: Session = Depends(get_db)):
+async def remove_student_scoped(occ_id: int, request: Request, db: Session = Depends(get_db),
+                                current = Depends(require_roles("super_admin", "center_admin"))):
     """Recurrence-aware remove. body: {student_id, scope: this|this_and_future}.
     Removes from the selected occurrence (and, for this_and_future, all later
     occurrences in the SAME stream). Past occurrences / other streams untouched."""
@@ -5217,6 +5565,7 @@ async def remove_student_scoped(occ_id: int, request: Request, db: Session = Dep
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     base = _baseline_ids(db, o.template_id)
     removed = 0
     for occ in _stream_occurrences(db, o, scope):
@@ -5229,7 +5578,12 @@ async def remove_student_scoped(occ_id: int, request: Request, db: Session = Dep
 
 
 @app.delete("/scheduling/templates/{template_id}/enroll/{student_id}")
-def unenroll_from_template(template_id: int, student_id: int, db: Session = Depends(get_db)):
+def unenroll_from_template(template_id: int, student_id: int, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin"))):
+    t = db.query(ClassTemplate).filter(ClassTemplate.id == template_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    _check_scheduling_access(current, t.center_id)
     e = db.query(Enrollment).filter(
         Enrollment.template_id == template_id, Enrollment.student_id == student_id
     ).first()
@@ -5242,7 +5596,12 @@ def unenroll_from_template(template_id: int, student_id: int, db: Session = Depe
 
 
 @app.get("/scheduling/templates/{template_id}/roster")
-def template_roster(template_id: int, db: Session = Depends(get_db)):
+def template_roster(template_id: int, db: Session = Depends(get_db),
+                    current = Depends(require_roles("super_admin", "center_admin", "staff"))):
+    t = db.query(ClassTemplate).filter(ClassTemplate.id == template_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    _check_scheduling_access(current, t.center_id)
     enrolls = db.query(Enrollment).filter(
         Enrollment.template_id == template_id, Enrollment.status == "active",
         Enrollment.occurrence_id.is_(None)
@@ -5259,12 +5618,14 @@ def template_roster(template_id: int, db: Session = Depends(get_db)):
 # ── Attendance (per occurrence, package-gated) ──
 
 @app.get("/scheduling/occurrences/{occ_id}/attendance")
-def occurrence_attendance(occ_id: int, db: Session = Depends(get_db)):
+def occurrence_attendance(occ_id: int, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     """Enrolled roster for this occurrence's template + each student's attendance
     status/notes for THIS occurrence — powers the detail dialog."""
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     subject = o.template.course if o.template else None
     att_map = {a.student_id: a for a in db.query(Attendance).filter(Attendance.session_id == occ_id).all()}
     rows = []
@@ -5297,10 +5658,12 @@ async def mark_occurrence_attendance(occ_id: int, student_id: int, request: Requ
                                      status: str = "present", notes: Optional[str] = None,
                                      require_feedback: bool = False,
                                      bypass_package: bool = False,
-                                     db: Session = Depends(get_db)):
+                                     db: Session = Depends(get_db),
+                                     current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
     if require_feedback and status == "present" and not notes:
         raise HTTPException(status_code=400, detail="Feedback/notes are required before marking present")
     att = db.query(Attendance).filter(
@@ -5319,6 +5682,7 @@ async def mark_occurrence_attendance(occ_id: int, student_id: int, request: Requ
     newly_present = status == "present" and (att is None or att.status != "present")
     if newly_present and not bypass_package:
         assert_can_book(db, student_id, o, count=1, is_makeup=is_makeup)
+    status_changed = att is None or att.status != status
     if att:
         att.status = status
         att.notes = notes
@@ -5326,6 +5690,10 @@ async def mark_occurrence_attendance(occ_id: int, student_id: int, request: Requ
         db.add(Attendance(session_id=occ_id, student_id=student_id, status=status, notes=notes,
                           is_makeup=is_makeup))
     db.commit()
+    # Only on an actual status change — re-saving feedback text on an
+    # already-marked record shouldn't re-notify the family.
+    if status_changed and status in ("present", "absent"):
+        _send_attendance_email(db, student_id, o, status, notes)
     # Non-blocking advisories for the admin UI (overdue invoice, low sessions…).
     return {"message": "Attendance recorded", "warnings": student_warnings(db, student_id)}
 
@@ -5341,11 +5709,19 @@ def scheduling_calendar(
     db: Session = Depends(get_db),
     current = Depends(require_roles("super_admin", "center_admin", "teacher", "student")),
 ):
-    # Auto-scope center admins to their center; teachers to their center.
+    # Lock center admins/teachers to their own center — a client-supplied
+    # center_id must never override this, or a center_admin could simply
+    # pass another center's id to see its calendar.
     caller_cal = current.get("obj")
     if caller_cal and getattr(caller_cal, "access_role", None) in ("center_admin", "teacher"):
-        if not center_id and getattr(caller_cal, "center_id", None):
+        if getattr(caller_cal, "center_id", None):
             center_id = caller_cal.center_id
+
+    # A student may only ever query their own calendar.
+    if current["type"] == "student":
+        if student_id is not None and student_id != current["id"]:
+            raise HTTPException(status_code=403, detail="Cannot view another student's calendar")
+        student_id = current["id"]
 
     q = db.query(ClassOccurrence)
     if start:
@@ -5455,6 +5831,17 @@ def scheduling_calendar(
         ).all():
             present_counts[a.session_id] = present_counts.get(a.session_id, 0) + 1
 
+    # This specific student's own attendance per occurrence — lets the admin
+    # UI (and the student portal) know a class already happened for them
+    # specifically, even same-day, so reschedule/cancel aren't offered for
+    # something already attended.
+    my_attendance = {}
+    if student_id is not None and occ_ids:
+        for a in db.query(Attendance).filter(
+            Attendance.session_id.in_(occ_ids), Attendance.student_id == student_id
+        ).all():
+            my_attendance[a.session_id] = a.status
+
     result = []
     for o in occs:
         t = templates.get(o.template_id)
@@ -5479,6 +5866,7 @@ def scheduling_calendar(
             "enrollment_count": enrolled_count,
             **({"enrolled_students": roster, "paid_count": paid_count} if include_roster else {}),
             "present_count": present_counts.get(o.id, 0),
+            **({"my_attendance": my_attendance.get(o.id)} if student_id is not None else {}),
             # Compatibility shape so the existing calendar cards/pills render unchanged.
             "batch": {
                 "id": o.template_id, "name": t.name if t else None,
@@ -6022,6 +6410,10 @@ def _invoice_html(detail, kind="invoice", org=None):
 def _maybe_email_invoice(db, inv, kind, to_email=None, do_send=True):
     if not do_send:
         return False
+    # Covers all three invoice-related emails — issued, receipt (payment
+    # recorded), and reminder — under the one "Invoices & Payments" toggle.
+    if not _notif_enabled(db, "invoices"):
+        return False
     detail = _invoice_detail(db, inv)
     to = to_email or detail["student_email"]
     if not to:
@@ -6034,6 +6426,121 @@ def _maybe_email_invoice(db, inv, kind, to_email=None, do_send=True):
             "receipt": f"Payment Receipt {inv.invoice_number} — {academy}"}[kind]
     html = _reminder_html(detail, org) if kind == "reminder" else _invoice_html(detail, kind, org)
     return _send_center_email(db, center_id, to, subj, html)
+
+
+def _send_attendance_email(db, student_id: int, occ: "ClassOccurrence", status: str, notes: Optional[str]):
+    """Notify a student's guardian when attendance is marked present/absent —
+    gated by the 'attendance' notification category."""
+    if not _notif_enabled(db, "attendance"):
+        return False
+    student = db.query(Student).filter(Student.id == student_id).first()
+    to = (student.guardian_email or student.email) if student else None
+    if not to:
+        return False
+    t = occ.template
+    teacher = db.query(Staff).filter(Staff.id == occ.teacher_id).first() if occ.teacher_id else None
+    center_id = t.center_id if t else None
+    brand = _org_brand(db, center_id)
+    kind = "attendance_present" if status == "present" else "attendance_absent"
+    tpl = _notif_template(db, kind)
+    ctx = {
+        "academy": brand["academy_name"],
+        "student_name": f"{student.first_name} {student.last_name}",
+        "course": (t.course if t else None) or "class",
+        "teacher": teacher.name if teacher else "your teacher",
+        "date": format_date_human(occ.date) if occ.date else "",
+        "time": occ.start_time or "",
+        "feedback_line": f" Feedback from the teacher: “{notes}”" if notes else "",
+    }
+    heading = tpl["heading"].format(**ctx)
+    intro = tpl["intro"].format(**ctx)
+    subj = tpl["subject"].format(**ctx)
+    logo = (f"<img src='{brand['logo_url']}' alt='{brand['academy_name']}' style='max-height:48px'>"
+            if brand["logo_url"] else
+            "<div style='font-size:22px;font-weight:900;letter-spacing:2px;color:#c0392b'>VAMA</div>")
+    html = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a;background:#f6f5fb;padding:32px 0">
+      <div style="background:#fff;border-radius:12px;padding:36px;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+        <div style="text-align:center;margin-bottom:24px">{logo}</div>
+        <h2 style="font-size:20px;margin:0 0 12px;color:#1a1a1a">{heading}</h2>
+        <p style="font-size:14px;line-height:1.6;color:#444;margin:0">{intro}</p>
+      </div>
+      <p style="text-align:center;font-size:11px;color:#aaa;margin-top:20px">{brand['academy_name']}</p>
+    </div>"""
+    return _send_center_email(db, center_id, to, subj, html)
+
+
+def _send_class_reminder_email(db, student, occ: "ClassOccurrence", teacher):
+    to = student.guardian_email or student.email
+    if not to:
+        return False
+    t = occ.template
+    center_id = t.center_id if t else None
+    brand = _org_brand(db, center_id)
+    tpl = _notif_template(db, "class_reminder")
+    ctx = {
+        "academy": brand["academy_name"],
+        "student_name": f"{student.first_name} {student.last_name}",
+        "course": (t.course if t else None) or "class",
+        "teacher": teacher.name if teacher else "your teacher",
+        "date": format_date_human(occ.date) if occ.date else "",
+        "time": occ.start_time or "",
+    }
+    heading = tpl["heading"].format(**ctx)
+    intro = tpl["intro"].format(**ctx)
+    subj = tpl["subject"].format(**ctx)
+    logo = (f"<img src='{brand['logo_url']}' alt='{brand['academy_name']}' style='max-height:48px'>"
+            if brand["logo_url"] else
+            "<div style='font-size:22px;font-weight:900;letter-spacing:2px;color:#c0392b'>VAMA</div>")
+    html = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:auto;color:#1a1a1a;background:#f6f5fb;padding:32px 0">
+      <div style="background:#fff;border-radius:12px;padding:36px;box-shadow:0 1px 4px rgba(0,0,0,0.06)">
+        <div style="text-align:center;margin-bottom:24px">{logo}</div>
+        <h2 style="font-size:20px;margin:0 0 12px;color:#1a1a1a">{heading}</h2>
+        <p style="font-size:14px;line-height:1.6;color:#444;margin:0">{intro}</p>
+      </div>
+      <p style="text-align:center;font-size:11px;color:#aaa;margin-top:20px">{brand['academy_name']}</p>
+    </div>"""
+    return _send_center_email(db, center_id, to, subj, html)
+
+
+@app.post("/admin/occurrences/{occ_id}/send-reminder")
+async def send_class_reminder(occ_id: int, request: Request, db: Session = Depends(get_db),
+                              current = Depends(require_roles("super_admin", "center_admin", "staff"))):
+    """Manually send a class reminder to the roster (or a subset) of one
+    occurrence. body: { student_ids?: [int] } — omit to send to everyone
+    currently rostered for this class."""
+    if not _notif_enabled(db, "class_reminders"):
+        raise HTTPException(status_code=400,
+            detail="Class reminder emails are turned off in Settings → Email Notifications.")
+    o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Occurrence not found")
+    _check_scheduling_access(current, o.template.center_id if o.template else None)
+    body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
+    target_ids = body.get("student_ids")
+    roster_ids = _occurrence_roster_ids(db, o) if o.template_id else set()
+    if target_ids:
+        roster_ids = roster_ids & set(target_ids) if roster_ids else set(target_ids)
+    if not roster_ids:
+        raise HTTPException(status_code=400, detail="No students to remind for this class")
+    teacher = db.query(Staff).filter(Staff.id == o.teacher_id).first() if o.teacher_id else None
+    students = db.query(Student).filter(Student.id.in_(roster_ids)).all()
+    sent = 0
+    for s in students:
+        if _send_class_reminder_email(db, s, o, teacher):
+            sent += 1
+    audit(db, "notification.class_reminder_sent", subject=("staff", current["id"]), request=request,
+          detail={"occurrence_id": occ_id, "recipients": len(students), "sent": sent})
+    return {"recipients": len(students), "sent": sent}
+
+
+def format_date_human(date_str: str) -> str:
+    from datetime import date as _dt_date
+    try:
+        return _dt_date.fromisoformat(date_str).strftime("%A, %d %b %Y")
+    except Exception:
+        return date_str
 
 
 def _recompute_invoice_status(inv):
@@ -6229,30 +6736,39 @@ async def create_invoice(request: Request, db: Session = Depends(get_db),
 
 
 @app.get("/admin/invoices/{inv_id}")
-def get_invoice(inv_id: int, db: Session = Depends(get_db)):
+def get_invoice(inv_id: int, db: Session = Depends(get_db),
+               current = Depends(require_roles("super_admin", "center_admin"))):
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot view another center's invoice")
     return _invoice_detail(db, inv)
 
 
 @app.get("/admin/invoices/{inv_id}/html", response_class=HTMLResponse)
-def invoice_html(inv_id: int, db: Session = Depends(get_db)):
+def invoice_html(inv_id: int, db: Session = Depends(get_db),
+                 current = Depends(require_roles("super_admin", "center_admin"))):
     """Full printable invoice (the default academy layout) — open + Ctrl/Cmd-P
     to save as PDF. This is the single invoice format; there is no choice."""
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot view another center's invoice")
     body = _invoice_html(_invoice_detail(db, inv), "invoice", _org_settings_for_center(db, inv.center_id))
     return f"<!doctype html><html><head><meta charset='utf-8'><title>Invoice {inv.invoice_number}</title></head><body>{body}</body></html>"
 
 
 @app.get("/student/invoices/{inv_id}/html", response_class=HTMLResponse)
-def student_invoice_html(inv_id: int, db: Session = Depends(get_db)):
+def student_invoice_html(inv_id: int, db: Session = Depends(get_db),
+                         current = Depends(require_roles("student"))):
     """Same printable invoice for the student portal — open in browser, Ctrl/Cmd-P to save PDF."""
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if inv.student_id != current["id"]:
+        raise HTTPException(status_code=403, detail="Cannot view another student's invoice")
     body = _invoice_html(_invoice_detail(db, inv), "invoice", _org_settings_for_center(db, inv.center_id))
     return f"<!doctype html><html><head><meta charset='utf-8'><title>Invoice {inv.invoice_number}</title></head><body>{body}</body></html>"
 
@@ -6348,12 +6864,15 @@ def delete_invoice(inv_id: int, request: Request, db: Session = Depends(get_db),
 
 
 @app.delete("/admin/invoices/{inv_id}/payments/{pay_id}")
-def delete_payment(inv_id: int, pay_id: int, db: Session = Depends(get_db)):
+def delete_payment(inv_id: int, pay_id: int, db: Session = Depends(get_db),
+                   current = Depends(require_roles("super_admin", "center_admin"))):
     """Delete a recorded payment and roll back the invoice balance/status."""
     p = db.query(InvoicePayment).filter(InvoicePayment.id == pay_id, InvoicePayment.invoice_id == inv_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Payment not found")
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
+    if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's invoice")
     inv.paid_amount = max(0.0, round((inv.paid_amount or 0) - p.amount, 2))
     if p.installment_id:
         ins = db.query(InvoiceInstallment).filter(InvoiceInstallment.id == p.installment_id).first()
@@ -6371,13 +6890,16 @@ def delete_payment(inv_id: int, pay_id: int, db: Session = Depends(get_db)):
 # ── Payment RECORDING (separate from creation) ──
 
 @app.post("/admin/invoices/{inv_id}/record-payment")
-async def record_payment(inv_id: int, request: Request, db: Session = Depends(get_db)):
+async def record_payment(inv_id: int, request: Request, db: Session = Depends(get_db),
+                         current = Depends(require_roles("super_admin", "center_admin"))):
     """Record a payment. body: { amount, method, reference?, paid_date?, installment_id?, send_receipt? }"""
     from datetime import date as _dd
     body = await request.json()
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot record a payment on another center's invoice")
     amount = float(body.get("amount") or 0)
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Payment amount must be greater than 0")
@@ -6405,12 +6927,15 @@ async def record_payment(inv_id: int, request: Request, db: Session = Depends(ge
 
 
 @app.post("/admin/invoices/{inv_id}/send")
-async def send_invoice(inv_id: int, request: Request, db: Session = Depends(get_db)):
+async def send_invoice(inv_id: int, request: Request, db: Session = Depends(get_db),
+                       current = Depends(require_roles("super_admin", "center_admin"))):
     """Email an invoice or reminder. body: { kind: invoice|reminder, to_email? }"""
     body = await request.json()
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot email another center's invoice")
     kind = body.get("kind", "invoice")
     if kind not in ("invoice", "reminder", "receipt"):
         kind = "invoice"
@@ -6422,10 +6947,13 @@ async def send_invoice(inv_id: int, request: Request, db: Session = Depends(get_
 
 # Backward-compat alias for the old send-email endpoint.
 @app.post("/admin/invoices/{inv_id}/send-email")
-async def send_invoice_email(inv_id: int, request: Request, db: Session = Depends(get_db)):
+async def send_invoice_email(inv_id: int, request: Request, db: Session = Depends(get_db),
+                             current = Depends(require_roles("super_admin", "center_admin"))):
     inv = db.query(Invoice).filter(Invoice.id == inv_id).first()
     if not inv:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot email another center's invoice")
     body = await request.json()
     ok = _maybe_email_invoice(db, inv, "invoice", body.get("to_email"), True)
     if not ok:
@@ -6549,6 +7077,70 @@ _ORG_KEYS = ["academy_name", "gst_number", "address", "phone", "email", "website
              "logo_url", "bank_details", "upi_id", "invoice_footer", "invoice_notes"]
 
 
+# ── Email notification settings (master switch + per-category toggles + templates) ──
+
+@app.get("/admin/notification-settings")
+def get_notification_settings(db: Session = Depends(get_db),
+                              current = Depends(require_roles("super_admin"))):
+    return _notif_settings(db)
+
+
+@app.put("/admin/notification-settings")
+async def put_notification_settings(request: Request, db: Session = Depends(get_db),
+                                    current = Depends(require_roles("super_admin"))):
+    """body: { master?: bool, class_reminders?: bool, attendance?: bool, invoices?: bool, activation?: bool }"""
+    body = await request.json()
+    fields = {"master": "notif.enabled.master", **{c: f"notif.enabled.{c}" for c in NOTIF_CATEGORIES}}
+    for field, key in fields.items():
+        if field in body:
+            value = "true" if body[field] else "false"
+            row = db.query(AppSetting).filter(AppSetting.key == key).first()
+            if row:
+                row.value = value
+            else:
+                db.add(AppSetting(key=key, value=value))
+    db.commit()
+    return _notif_settings(db)
+
+
+@app.get("/admin/notification-templates")
+def get_notification_templates(db: Session = Depends(get_db),
+                               current = Depends(require_roles("super_admin"))):
+    return {kind: _notif_template(db, kind) for kind in NOTIF_TEMPLATE_DEFAULTS}
+
+
+@app.put("/admin/notification-templates/{kind}")
+async def put_notification_template(kind: str, request: Request, db: Session = Depends(get_db),
+                                    current = Depends(require_roles("super_admin"))):
+    """body: { subject?, heading?, intro?, button_label? } — only fields the
+    template actually has (see NOTIF_TEMPLATE_DEFAULTS) are accepted."""
+    if kind not in NOTIF_TEMPLATE_DEFAULTS:
+        raise HTTPException(status_code=404, detail="Unknown template")
+    body = await request.json()
+    for field in NOTIF_TEMPLATE_DEFAULTS[kind]:
+        if field in body:
+            key = f"notif.template.{kind}.{field}"
+            value = body[field]
+            row = db.query(AppSetting).filter(AppSetting.key == key).first()
+            if row:
+                row.value = value
+            else:
+                db.add(AppSetting(key=key, value=value))
+    db.commit()
+    return _notif_template(db, kind)
+
+
+@app.post("/admin/notification-templates/{kind}/reset")
+def reset_notification_template(kind: str, db: Session = Depends(get_db),
+                                current = Depends(require_roles("super_admin"))):
+    """Delete any saved override so the template falls back to the built-in default."""
+    if kind not in NOTIF_TEMPLATE_DEFAULTS:
+        raise HTTPException(status_code=404, detail="Unknown template")
+    db.query(AppSetting).filter(AppSetting.key.like(f"notif.template.{kind}.%")).delete(synchronize_session=False)
+    db.commit()
+    return _notif_template(db, kind)
+
+
 @app.get("/admin/org-settings")
 def get_org_settings(db: Session = Depends(get_db),
                      current = Depends(require_roles("super_admin"))):
@@ -6616,14 +7208,19 @@ async def put_center_billing_settings(request: Request, db: Session = Depends(ge
 
 
 @app.post("/admin/upload-logo")
-async def upload_logo(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Upload an academy logo; stores it and saves the absolute URL to org settings."""
+async def upload_logo(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
+                      current = Depends(require_roles("super_admin"))):
+    """Upload the (global) academy logo; stores it and saves the absolute URL
+    to org settings. No per-center variant exists, so this is super_admin-only."""
     ext = (file.filename or "logo.png").rsplit(".", 1)[-1].lower()
-    if ext not in ("png", "jpg", "jpeg", "webp", "svg"):
+    if ext not in ("png", "jpg", "jpeg", "webp"):   # svg dropped: could carry an embedded <script>
         ext = "png"
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Logo file too large (max 5MB)")
     path = f"static/logo.{ext}"
     with open(path, "wb") as f:
-        f.write(await file.read())
+        f.write(contents)
     url = str(request.base_url).rstrip("/") + "/" + path
     row = db.query(AppSetting).filter(AppSetting.key == "org.logo_url").first()
     if row:
@@ -6706,7 +7303,8 @@ async def public_invoice_verify(inv_id: int, request: Request, db: Session = Dep
 # ── Admin dashboard alerts ──
 
 @app.get("/admin/dashboard-alerts")
-def dashboard_alerts(center_id: Optional[int] = None, db: Session = Depends(get_db)):
+def dashboard_alerts(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                     current = Depends(require_roles("super_admin", "center_admin"))):
     """Aggregated alerts: overdue invoices, expiring packages, low sessions,
     installments due soon, makeup violations."""
     from datetime import date as _date, timedelta
@@ -6714,6 +7312,9 @@ def dashboard_alerts(center_id: Optional[int] = None, db: Session = Depends(get_
     today_s = str(today)
     soon_s = str(today + timedelta(days=7))
 
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center   # center_admin: locked to their own center, client-supplied value ignored
     sq = db.query(Student)
     if center_id:
         sq = sq.filter(Student.center_id == center_id)
@@ -6761,10 +7362,14 @@ def dashboard_alerts(center_id: Optional[int] = None, db: Session = Depends(get_
 
 
 @app.get("/admin/dashboard/today-attendance")
-def dashboard_today_attendance(center_id: Optional[int] = None, db: Session = Depends(get_db)):
+def dashboard_today_attendance(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                               current = Depends(require_roles("super_admin", "center_admin"))):
     """Today's classes and whether the teacher has marked attendance yet —
     powers the admin dashboard's teacher-monitoring widget."""
     from collections import defaultdict
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center
     today = str(_d.today())
     q = db.query(ClassOccurrence).filter(
         ClassOccurrence.date == today, ClassOccurrence.status == "scheduled",
@@ -6800,10 +7405,14 @@ def dashboard_today_attendance(center_id: Optional[int] = None, db: Session = De
 
 
 @app.get("/admin/dashboard/booking-activity")
-def dashboard_booking_activity(limit: int = 8, center_id: Optional[int] = None, db: Session = Depends(get_db)):
+def dashboard_booking_activity(limit: int = 8, center_id: Optional[int] = None, db: Session = Depends(get_db),
+                               current = Depends(require_roles("super_admin", "center_admin"))):
     """Recent student booking/reschedule/cancellation events — powers the
     admin dashboard's student-activity monitoring widget."""
     import json
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center
     q = db.query(AuditLog).filter(
         AuditLog.action.in_(["booking.booked", "booking.rescheduled", "booking.cancelled"])
     )
@@ -6856,6 +7465,32 @@ def run_installment_reminders(db: Session = Depends(get_db)):
         if _maybe_email_invoice(db, inv, "reminder", None, True):
             sent += 1
     return {"reminders_sent": sent, "scanned": len(_installment_reminder_targets(db))}
+
+
+@app.post("/admin/run-schedule-rollover")
+def run_schedule_rollover(db: Session = Depends(get_db)):
+    """Top up every open-ended recurring class's occurrences out to the
+    current Class Generation Horizon (Settings → Scheduling). Without this
+    running periodically, a class's calendar just stops generating new dates
+    once the horizon computed at creation/last-edit time is reached — this
+    is what keeps it rolling forward. Designed to be invoked daily by an
+    external scheduler, same as /admin/run-overdue and
+    /admin/run-installment-reminders."""
+    from datetime import date as _dd
+    today = str(_dd.today())
+    created_total = 0
+    templates_topped_up = 0
+    templates = db.query(ClassTemplate).filter(ClassTemplate.status == "active").all()
+    for t in templates:
+        if not t.rule or t.rule.end_date:
+            continue  # fixed-end series don't need rolling — they stop on purpose
+        created = scheduling.generate_for_template(db, t, from_date=today)
+        if created:
+            created_total += created
+            templates_topped_up += 1
+    db.commit()
+    return {"templates_scanned": len(templates), "templates_topped_up": templates_topped_up,
+            "occurrences_created": created_total}
 
 
 @app.post("/admin/run-overdue")
@@ -6927,6 +7562,11 @@ async def create_subscription(request: Request, db: Session = Depends(get_db),
                              current = Depends(require_roles("super_admin", "center_admin"))):
     from datetime import date as _dd
     body = await request.json()
+    student = db.query(Student).filter(Student.id == int(body["student_id"])).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role == "center_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot create a subscription for another center's student")
     first = body.get("first_invoice_date") or body.get("start_date") or str(_dd.today())
     sub = Subscription(
         student_id=int(body["student_id"]),
@@ -6957,6 +7597,10 @@ async def update_subscription(sub_id: int, request: Request, db: Session = Depen
     sub = db.query(Subscription).filter(Subscription.id == sub_id).first()
     if not sub:
         raise HTTPException(status_code=404, detail="Not found")
+    if current.get("obj").access_role == "center_admin":
+        student = db.query(Student).filter(Student.id == sub.student_id).first()
+        if not student or student.center_id != current["obj"].center_id:
+            raise HTTPException(status_code=403, detail="Cannot modify another center's subscription")
     for field in ["plan_name", "billing_cycle", "amount", "sessions_total", "start_date",
                   "renewal_date", "status", "auto_renew", "create_offset_days", "due_offset_days",
                   "first_invoice_date", "next_invoice_date", "end_type", "end_date",
@@ -7028,10 +7672,15 @@ def run_subscriptions(db: Session = Depends(get_db)):
 # ==================== PAYMENT — Dashboard ====================
 
 @app.get("/admin/reports")
-def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Session = Depends(get_db)):
+def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Session = Depends(get_db),
+                  current = Depends(require_roles("super_admin", "center_admin"))):
     """Comprehensive business intelligence — sales, students, teachers, attendance, operations."""
     from datetime import datetime as _dt, timedelta as _td
     from collections import defaultdict
+
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center   # center_admin: locked to their own center, client-supplied value ignored
 
     now = _dt.utcnow()
     days_map = {"today": 1, "week": 7, "month": 30, "quarter": 90, "year": 365}
@@ -8020,6 +8669,8 @@ def staff_profile(staff_id: int, db: Session = Depends(get_db),
     staff = db.query(Staff).filter(Staff.id == staff_id).first()
     if not staff:
         raise HTTPException(status_code=404, detail="Staff not found")
+    if current.get("obj").access_role == "center_admin" and staff.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot view another center's staff")
 
     templates = db.query(ClassTemplate).filter(
         ClassTemplate.teacher_id == staff_id, ClassTemplate.status == "active"
@@ -8153,6 +8804,7 @@ async def assign_student_center(student_id: int, request: Request, db: Session =
 
 @app.post("/admin/login")
 async def admin_login(request: Request, db: Session = Depends(get_db)):
+    rate_limiter.check(f"login:{_client_ip(request)}", max_hits=10, window_seconds=300)
     import asyncio
     body = await request.json()
     email    = body.get("email", "").strip().lower()
@@ -8225,6 +8877,8 @@ async def set_student_password(student_id: int, request: Request, db: Session = 
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role == "center_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot set the password of another center's student")
     _admin_force_set_password(db, "student", student, new_pass, request)
     return {"message": "Password updated", "student_id": student_id}
 
@@ -8237,6 +8891,12 @@ async def set_staff_password(staff_id: int, request: Request, db: Session = Depe
     staff = db.query(Staff).filter(Staff.id == staff_id).first()
     if not staff:
         raise HTTPException(status_code=404, detail="Staff not found")
+    # A center_admin may only reset staff within their own center — without this,
+    # a center_admin could target ANY staff row by id, including a super_admin's
+    # (super_admin.center_id is NULL, so it never matches a center_admin's own
+    # center_id and this check blocks that path too).
+    if current.get("obj").access_role == "center_admin" and staff.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot set the password of another center's staff")
     _admin_force_set_password(db, "staff", staff, new_pass, request)
     return {"message": "Password updated", "staff_id": staff_id}
 
@@ -8422,22 +9082,42 @@ _DEFAULTS = {
     "currency_symbol":      "₹",
     "primary_color":        "#463a7a",
     "attendance_feedback":  "required_for_present",
-    "session_start_hour":   "8",
-    "session_end_hour":     "21",
+    "occurrence_horizon_days": "365",
     "razorpay_key_id":      "",
     "razorpay_key_secret":  "",
     "razorpay_enabled":     "false",
 }
 
 
+_SECRET_KEY_MARKERS = ("pass", "secret", "password")
+
+
+def _mask_secret_keys(result: dict) -> dict:
+    for k in list(result.keys()):
+        if result.get(k) and (k in _MASKED_KEYS or any(m in k.lower() for m in _SECRET_KEY_MARKERS)):
+            result[k] = "••••••••"
+    return result
+
+
+def _settings_visible_to(result: dict, current: dict) -> dict:
+    """Center_admin must never see another center's `center_{id}_*` settings —
+    those hold that center's own SMTP password / Razorpay secret / profile.
+    Global (unprefixed) keys are shared config, not sensitive, and stay visible."""
+    obj = current.get("obj")
+    if getattr(obj, "access_role", None) == "super_admin":
+        return result
+    own_prefix = f"center_{getattr(obj, 'center_id', None)}_"
+    return {
+        k: v for k, v in result.items()
+        if not k.startswith("center_") or k.startswith(own_prefix)
+    }
+
+
 def _get_all_settings(db: Session) -> dict:
     rows = db.query(AppSetting).all()
     stored = {r.key: r.value for r in rows}
     result = {**_DEFAULTS, **stored}
-    for k in _MASKED_KEYS:
-        if k in result and result[k]:
-            result[k] = "••••••••"
-    return result
+    return _mask_secret_keys(result)
 
 
 def _razorpay_for_center(db: Session, center_id) -> dict:
@@ -8462,8 +9142,12 @@ def _razorpay_for_center(db: Session, center_id) -> dict:
 
 
 @app.get("/admin/razorpay-settings")
-def get_razorpay_settings(center_id: int = None, db: Session = Depends(get_db)):
+def get_razorpay_settings(center_id: int = None, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin"))):
     """Get Razorpay settings for a specific center (or global if no center_id)."""
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center   # center_admin: locked to their own center, never the global keys
     if center_id:
         prefix = f"center_{center_id}_razorpay."
         rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all()}
@@ -8484,10 +9168,14 @@ def get_razorpay_settings(center_id: int = None, db: Session = Depends(get_db)):
 
 
 @app.put("/admin/razorpay-settings")
-async def put_razorpay_settings(request: Request, db: Session = Depends(get_db)):
+async def put_razorpay_settings(request: Request, db: Session = Depends(get_db),
+                                current = Depends(require_roles("super_admin", "center_admin"))):
     """Save Razorpay keys for a center or globally. Body: {center_id?, key_id, key_secret, enabled}."""
     body = await request.json()
     center_id = body.get("center_id")
+    own_center = _caller_center_id(current)
+    if own_center is not None:
+        center_id = own_center   # center_admin: locked to their own center, can never touch the global keys
 
     def _upsert(key: str, value: str):
         row = db.query(AppSetting).filter(AppSetting.key == key).first()
@@ -8513,15 +9201,22 @@ async def put_razorpay_settings(request: Request, db: Session = Depends(get_db))
 
 
 @app.get("/admin/settings")
-def get_settings(db: Session = Depends(get_db)):
-    return _get_all_settings(db)
+def get_settings(db: Session = Depends(get_db),
+                 current = Depends(require_roles("super_admin", "center_admin"))):
+    return _settings_visible_to(_get_all_settings(db), current)
 
 
 @app.put("/admin/settings")
-async def update_settings(request: Request, db: Session = Depends(get_db)):
+async def update_settings(request: Request, db: Session = Depends(get_db),
+                          current = Depends(require_roles("super_admin", "center_admin"))):
     body = await request.json()
+    obj = current.get("obj")
+    is_super = getattr(obj, "access_role", None) == "super_admin"
+    own_prefix = f"center_{getattr(obj, 'center_id', None)}_"
     for key, value in body.items():
-        if key in _MASKED_KEYS and value == "••••••••":
+        if not is_super and key.startswith("center_") and not key.startswith(own_prefix):
+            continue  # never let a center_admin write another center's settings
+        if (key in _MASKED_KEYS or any(m in key.lower() for m in _SECRET_KEY_MARKERS)) and value == "••••••••":
             continue  # Don't overwrite with the masked placeholder
         row = db.query(AppSetting).filter(AppSetting.key == key).first()
         if row:
@@ -8529,15 +9224,17 @@ async def update_settings(request: Request, db: Session = Depends(get_db)):
         else:
             db.add(AppSetting(key=key, value=str(value) if value is not None else None))
     db.commit()
-    return _get_all_settings(db)
+    return _settings_visible_to(_get_all_settings(db), current)
 
 
 @app.post("/admin/settings/test-email")
-async def test_email(request: Request, db: Session = Depends(get_db)):
+async def test_email(request: Request, db: Session = Depends(get_db),
+                     current = Depends(require_roles("super_admin", "center_admin"))):
     import smtplib, os
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
 
+    rate_limiter.check(f"test-email:{_client_ip(request)}", max_hits=5, window_seconds=300)
     body = await request.json()
     to_email = body.get("to_email", "")
     if not to_email:

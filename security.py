@@ -73,7 +73,15 @@ def validate_password_strength(password: str) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────
 # JWT access / refresh tokens
 # ──────────────────────────────────────────────────────────────────────────
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_INSECURE_DEV_SECRET")
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    # A silent insecure fallback here would mean every token becomes forgeable
+    # with a publicly-known string the moment the env var is ever unset —
+    # fail loudly at startup instead so that can never happen quietly.
+    raise RuntimeError(
+        "JWT_SECRET environment variable is not set. Refusing to start with an "
+        "insecure default signing key — set JWT_SECRET before running the app."
+    )
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "60"))
 REFRESH_TOKEN_DAYS = int(os.getenv("REFRESH_TOKEN_DAYS", "7"))

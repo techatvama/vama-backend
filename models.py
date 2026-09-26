@@ -143,6 +143,7 @@ class Grade(Base):
     level = Column(Integer, nullable=False, default=0)
     display_order = Column(Integer, default=0)
     description = Column(String, nullable=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -153,6 +154,7 @@ class Subject(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -164,6 +166,7 @@ class ExamSession(Base):
     exam_board = Column(String, nullable=False)
     exam_date = Column(Date, nullable=True)
     is_active = Column(Boolean, default=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -175,6 +178,7 @@ class Syllabus(Base):
     subject = Column(String, nullable=True)
     grade_name = Column(String, nullable=True)
     syllabus_type = Column(String, nullable=True)
+    center_id = Column(Integer, ForeignKey("centers.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     modules = relationship("SyllabusModule", back_populates="syllabus", order_by="SyllabusModule.order")

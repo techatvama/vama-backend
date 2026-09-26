@@ -11,7 +11,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from models import (
-    ClassTemplate, RecurrenceRule, ClassOccurrence, Holiday, Attendance,
+    ClassTemplate, RecurrenceRule, ClassOccurrence, Holiday, Attendance, AppSetting,
 )
 
 # Weekday code <-> Python weekday() (Mon=0 .. Sun=6)
@@ -19,6 +19,21 @@ WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
 CODE_TO_IDX = {c: i for i, c in enumerate(WEEKDAY_CODES)}
 
 HORIZON_DAYS = int(os.getenv("OCCURRENCE_HORIZON_DAYS", "365"))
+
+
+def get_horizon_days(db: Session) -> int:
+    """How far ahead (in days) recurring classes get pre-generated into
+    class_occurrences — admin-editable (Settings → Scheduling) so an academy
+    can trade off "how far ahead can I see/manage my calendar" against
+    database row growth as it scales up. Falls back to the env var default
+    when nothing's been configured yet."""
+    row = db.query(AppSetting).filter(AppSetting.key == "occurrence_horizon_days").first()
+    if row and row.value:
+        try:
+            return max(30, int(row.value))
+        except ValueError:
+            pass
+    return HORIZON_DAYS
 
 
 # ──────────────────────────── date helpers ────────────────────────────
@@ -50,10 +65,10 @@ def _add_months(d: date, months: int) -> date:
 
 # ──────────────────────────── expansion ────────────────────────────
 
-def horizon_end(rule: RecurrenceRule, today: Optional[date] = None) -> date:
+def horizon_end(rule: RecurrenceRule, today: Optional[date] = None, horizon_days: Optional[int] = None) -> date:
     """The last date to materialize: rule.end_date if set, else a rolling cap."""
     today = today or date.today()
-    cap = today + timedelta(days=HORIZON_DAYS)
+    cap = today + timedelta(days=horizon_days if horizon_days is not None else HORIZON_DAYS)
     if rule.end_date:
         return min(_parse(rule.end_date), cap)
     return cap
@@ -62,7 +77,8 @@ def horizon_end(rule: RecurrenceRule, today: Optional[date] = None) -> date:
 def expand_occurrences(rule: RecurrenceRule, *, until: Optional[date] = None,
                        from_date: Optional[date] = None,
                        holiday_dates: Optional[set[str]] = None,
-                       today: Optional[date] = None) -> list[date]:
+                       today: Optional[date] = None,
+                       horizon_days: Optional[int] = None) -> list[date]:
     """Return the list of dates this rule produces, bounded by [from_date, until].
 
     `until` defaults to horizon_end(rule). Holiday dates are skipped.
@@ -70,7 +86,7 @@ def expand_occurrences(rule: RecurrenceRule, *, until: Optional[date] = None,
     start = _parse(rule.start_date)
     if from_date and from_date > start:
         start = from_date
-    end = until or horizon_end(rule, today)
+    end = until or horizon_end(rule, today, horizon_days)
     if end < start:
         return []
     holiday_dates = holiday_dates or set()
@@ -147,7 +163,7 @@ def generate_for_template(db: Session, template: ClassTemplate, *,
         return 0
     fd = _parse(from_date) if from_date else None
     holidays = holiday_dates_for(db, template.center_id)
-    wanted = expand_occurrences(rule, from_date=fd, holiday_dates=holidays)
+    wanted = expand_occurrences(rule, from_date=fd, holiday_dates=holidays, horizon_days=get_horizon_days(db))
     wanted_set = {_fmt(d) for d in wanted}
 
     existing = db.query(ClassOccurrence).filter(

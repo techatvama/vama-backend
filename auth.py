@@ -197,33 +197,102 @@ def _branded_email_html(*, academy: str, logo_url: str, heading: str, intro: str
     </div>"""
 
 
+
+# ══════════════════════════ Notification settings ══════════════════════════
+# One master switch plus a toggle per category, stored as plain AppSetting
+# key-value rows (same pattern as org.* settings) so no migration is needed.
+# Master OFF suppresses every category unconditionally; master ON lets each
+# category's own toggle decide. Password reset is deliberately never gated —
+# blocking a student's only way back into their account for the sake of a
+# marketing-style mute switch would be a support nightmare, not a feature.
+NOTIF_CATEGORIES = ["class_reminders", "attendance", "invoices", "activation"]
+NOTIF_CATEGORY_DEFAULTS = {"class_reminders": False, "attendance": False, "invoices": True, "activation": True}
+
+# Editable templates: heading/intro/button_label are merged onto the fixed
+# branded shell (logo, button link, expiry note) — the link/token machinery
+# itself isn't editable, only the human-facing copy around it.
+NOTIF_TEMPLATE_DEFAULTS = {
+    "activation": {
+        "subject": "Activate your account — {academy}",
+        "heading": "Welcome, {name}",
+        "intro": "An account has been created for you at {academy}. Set your password below to activate it and get started.",
+        "button_label": "Activate my account",
+    },
+    "password_reset": {
+        "subject": "Reset your password — {academy}",
+        "heading": "Reset your password, {name}",
+        "intro": "We received a request to reset the password on your account. Click below to choose a new one.",
+        "button_label": "Reset my password",
+    },
+    "class_reminder": {
+        "subject": "Reminder: {course} class on {date}",
+        "heading": "Upcoming class reminder",
+        "intro": "This is a reminder that {student_name} has a {course} class with {teacher} on {date} at {time}.",
+    },
+    "attendance_present": {
+        "subject": "Attendance update — {course}",
+        "heading": "Attendance recorded",
+        "intro": "{student_name} was marked present for {course} on {date}.{feedback_line}",
+    },
+    "attendance_absent": {
+        "subject": "Attendance update — {course}",
+        "heading": "Attendance recorded",
+        "intro": "{student_name} was marked absent for {course} on {date}.",
+    },
+}
+
+
+def _notif_settings(db: Session) -> dict:
+    rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like("notif.enabled.%")).all()}
+    return {
+        "master": (rows.get("notif.enabled.master", "true") == "true"),
+        **{c: (rows.get(f"notif.enabled.{c}", str(NOTIF_CATEGORY_DEFAULTS[c]).lower()) == "true")
+           for c in NOTIF_CATEGORIES},
+    }
+
+
+def _notif_enabled(db: Session, category: str) -> bool:
+    s = _notif_settings(db)
+    return s["master"] and s.get(category, False)
+
+
+def _notif_template(db: Session, kind: str) -> dict:
+    defaults = NOTIF_TEMPLATE_DEFAULTS[kind]
+    rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"notif.template.{kind}.%")).all()}
+    return {field: rows.get(f"notif.template.{kind}.{field}") or default
+            for field, default in defaults.items()}
+
+
 def _send_activation_email(db: Session, to: str, name: str, raw_token: str, center_id: Optional[int] = None):
     link = f"{FRONTEND_URL}/activate?token={raw_token}"
     brand = _org_brand(db, center_id)
+    tpl = _notif_template(db, "activation")
+    ctx = {"academy": brand["academy_name"], "name": name}
     html = _branded_email_html(
         academy=brand["academy_name"], logo_url=brand["logo_url"],
-        heading=f"Welcome, {name}",
-        intro="An account has been created for you at " + brand["academy_name"] +
-              ". Set your password below to activate it and get started.",
-        button_label="Activate my account", button_link=link,
+        heading=tpl["heading"].format(**ctx),
+        intro=tpl["intro"].format(**ctx),
+        button_label=tpl["button_label"], button_link=link,
         expiry_note=f"This link expires in {security.TOKEN_EXPIRY_MINUTES} minutes and can only be used once. "
                      "If you weren't expecting this, you can safely ignore this email.",
     )
-    send_email(to, f"Activate your account — {brand['academy_name']}", html)
+    send_email(to, tpl["subject"].format(**ctx), html)
 
 
 def _send_reset_email(db: Session, to: str, name: str, raw_token: str, center_id: Optional[int] = None):
     link = f"{FRONTEND_URL}/reset-password?token={raw_token}"
     brand = _org_brand(db, center_id)
+    tpl = _notif_template(db, "password_reset")
+    ctx = {"academy": brand["academy_name"], "name": name}
     html = _branded_email_html(
         academy=brand["academy_name"], logo_url=brand["logo_url"],
-        heading=f"Reset your password, {name}",
-        intro="We received a request to reset the password on your account. Click below to choose a new one.",
-        button_label="Reset my password", button_link=link,
+        heading=tpl["heading"].format(**ctx),
+        intro=tpl["intro"].format(**ctx),
+        button_label=tpl["button_label"], button_link=link,
         expiry_note=f"This link expires in {security.TOKEN_EXPIRY_MINUTES} minutes. "
                      "If you didn't request this, you can safely ignore this email.",
     )
-    send_email(to, f"Reset your password — {brand['academy_name']}", html)
+    send_email(to, tpl["subject"].format(**ctx), html)
 
 
 # ══════════════════════════ Audit + login history ══════════════════════════
@@ -353,8 +422,12 @@ def provision_account(db: Session, subject_type: str, obj, *, actor=None,
     deliver_to = notify_email or obj.email
     if send_activation and deliver_to:
         activation_token = issue_auth_token(db, subject_type, obj.id, "activation")
-        _send_activation_email(db, deliver_to, display_name(subject_type, obj), activation_token,
-                               center_id=getattr(obj, "center_id", None))
+        # The activation-email toggle only applies to students (item 5 of the
+        # notification settings) — staff accounts always get theirs, since
+        # that's an internal admin action, not a family-facing notification.
+        if subject_type != "student" or _notif_enabled(db, "activation"):
+            _send_activation_email(db, deliver_to, display_name(subject_type, obj), activation_token,
+                                   center_id=getattr(obj, "center_id", None))
     return activation_token
 
 
