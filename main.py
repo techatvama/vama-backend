@@ -7286,7 +7286,12 @@ async def upload_logo(request: Request, file: UploadFile = File(...), db: Sessio
     path = f"static/logo.{ext}"
     with open(path, "wb") as f:
         f.write(contents)
-    url = str(request.base_url).rstrip("/") + "/" + path
+    # Never derive this from the incoming request's Host header — whichever
+    # domain the upload happened to be made through (a Railway subdomain,
+    # localhost during testing, ...) would get baked in and then shown
+    # wherever the logo renders (invoices, login page, emails).
+    backend_base = _osmod.getenv("BACKEND_URL", "https://vama-backend-production-115a.up.railway.app")
+    url = f"{backend_base.rstrip('/')}/{path}"
     row = db.query(AppSetting).filter(AppSetting.key == "org.logo_url").first()
     if row:
         row.value = url
