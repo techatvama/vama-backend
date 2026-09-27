@@ -1071,7 +1071,9 @@ async def create_student(request: Request, db: Session = Depends(get_db),
         nearest_vama_center=body.get("nearest_vama_center"),
         current_grade=body.get("current_grade", "Debut"),
         syllabus_type=body.get("syllabus_type", "Trinity"),
-        instrument=body.get("instrument") or body.get("desired_course"),
+        # `instrument` is a real assignment, not the applicant's stated wish —
+        # only set it when a teacher_id comes with it (see _build_progress_response).
+        instrument=body.get("instrument") if body.get("teacher_id") else None,
         teacher_id=body.get("teacher_id"),
         center_id=center_id,
     )
@@ -1707,7 +1709,9 @@ async def approve_student_application(application_id: int, request: Request, db:
         preferred_mode_of_contact=a.preferred_mode_of_contact,
         current_grade=body.get("current_grade", "Debut"),
         syllabus_type=body.get("syllabus_type", "Trinity"),
-        instrument=body.get("instrument") or a.desired_course,
+        # `instrument` is a real assignment, not the applicant's stated wish —
+        # only set it when a teacher_id comes with it (see _build_progress_response).
+        instrument=body.get("instrument") if body.get("teacher_id") else None,
         teacher_id=body.get("teacher_id"),
         center_id=a.center_id,  # Phase 2A: Copy center from application
     )
@@ -2290,9 +2294,32 @@ def _build_progress_response(student: Student, db: Session, subject: Optional[st
         target = next((e for e in active_enrollments if e.subject == subject), active_enrollments[0])
         target_subject, target_grade = target.subject, target.grade
     else:
-        target_subject = student.instrument or student.desired_course
+        # A real assignment sets instrument AND teacher_id together (mirrored
+        # from LearningEnrollment/StudentInstructor — see
+        # _sync_student_primary), so require both. `desired_course` is just
+        # what the applicant asked for and must never be treated as an
+        # assignment; a couple of older code paths also used to copy it
+        # straight into `instrument` with no teacher_id — requiring
+        # teacher_id here catches those too, without needing a data fix.
+        target_subject = student.instrument if student.teacher_id else None
         target_grade = student.current_grade
-        enrolled_subjects = [{"subject": target_subject, "grade": target_grade, "syllabus_type": student.syllabus_type or "Trinity"}]
+        enrolled_subjects = ([{"subject": target_subject, "grade": target_grade, "syllabus_type": student.syllabus_type or "Trinity"}]
+                             if target_subject else [])
+
+    if not target_subject:
+        return {
+            "student": {
+                "id": student.id, "first_name": student.first_name, "last_name": student.last_name,
+                "name": f"{student.first_name} {student.last_name}", "email": student.email,
+                "instrument": "", "grade": "", "current_grade": student.current_grade or "Debut",
+                "desired_course": student.desired_course or "", "primary_phone_number": student.primary_phone_number or "",
+                "nearest_vama_center": student.nearest_vama_center or "", "syllabus_type": student.syllabus_type or "Trinity",
+                "is_exam_student": student.is_exam_student or False, "exam_date": student.exam_date,
+                "enrolled_subjects": [],
+            },
+            "syllabus": None,
+            "not_assigned": True,
+        }
 
     # Match the syllabus by subject + grade — the same combination the
     # Syllabus Builder treats as a unique identity when creating one. Matching
