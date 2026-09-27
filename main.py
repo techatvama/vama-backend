@@ -44,7 +44,7 @@ from schemas import StaffCreate
 from auth import (router as auth_router, provision_account, email_exists, staff_email_exists, verify_credentials,
                    audit, issue_auth_token, _send_activation_email, display_name, linked_students, send_email,
                    roles_for, require_roles, _notif_enabled, _notif_settings, _notif_template, _org_brand,
-                   _branded_email_html, NOTIF_CATEGORIES, NOTIF_CATEGORY_DEFAULTS, NOTIF_TEMPLATE_DEFAULTS,
+                   _branded_email_html, _notif_key, NOTIF_CATEGORIES, NOTIF_CATEGORY_DEFAULTS, NOTIF_TEMPLATE_DEFAULTS,
                    rate_limiter, _client_ip)
 import security
 import enrollment as _enrollment_module
@@ -4466,6 +4466,25 @@ def remove_student_from_session(
     return {"message": "Removed"}
 
 
+def _scheduling_setting(db, center_id, key: str, default: str) -> str:
+    """Center's own scheduling setting → global default → built-in default."""
+    for k in ([f"center_{center_id}_scheduling.{key}"] if center_id else []) + [key]:
+        row = db.query(AppSetting).filter(AppSetting.key == k).first()
+        if row and row.value:
+            return row.value
+    return default
+
+
+@app.get("/scheduling/settings")
+def get_scheduling_settings(db: Session = Depends(get_db),
+                            current = Depends(require_roles("super_admin", "center_admin", "staff"))):
+    """Effective scheduling rules for the caller's center (teachers read this
+    to know whether attendance feedback is mandatory)."""
+    cid = getattr(current.get("obj"), "center_id", None)
+    return {"attendance_feedback": _scheduling_setting(db, cid, "attendance_feedback", "required_for_present"),
+            "occurrence_horizon_days": scheduling.get_horizon_days(db, cid)}
+
+
 @app.put("/sessions/{session_id}/attendance/{student_id}")
 def mark_attendance(
     session_id: int, student_id: int,
@@ -4476,7 +4495,9 @@ def mark_attendance(
     db: Session = Depends(get_db),
     current = Depends(require_roles("super_admin", "center_admin", "staff")),
 ):
-    if require_feedback and status == "present" and not notes:
+    if (require_feedback and status == "present" and not notes
+            and _scheduling_setting(db, getattr(current.get("obj"), "center_id", None),
+                                    "attendance_feedback", "required_for_present") != "optional"):
         raise HTTPException(status_code=400, detail="Feedback/notes are required before marking present")
     att = db.query(Attendance).filter(
         Attendance.session_id == session_id,
@@ -5664,7 +5685,9 @@ async def mark_occurrence_attendance(occ_id: int, student_id: int, request: Requ
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
     _check_scheduling_access(current, o.template.center_id if o.template else None)
-    if require_feedback and status == "present" and not notes:
+    if (require_feedback and status == "present" and not notes
+            and _scheduling_setting(db, getattr(current.get("obj"), "center_id", None),
+                                    "attendance_feedback", "required_for_present") != "optional"):
         raise HTTPException(status_code=400, detail="Feedback/notes are required before marking present")
     att = db.query(Attendance).filter(
         Attendance.session_id == occ_id, Attendance.student_id == student_id
@@ -6412,7 +6435,7 @@ def _maybe_email_invoice(db, inv, kind, to_email=None, do_send=True):
         return False
     # Covers all three invoice-related emails — issued, receipt (payment
     # recorded), and reminder — under the one "Invoices & Payments" toggle.
-    if not _notif_enabled(db, "invoices"):
+    if not _notif_enabled(db, "invoices", getattr(inv, "center_id", None)):
         return False
     detail = _invoice_detail(db, inv)
     to = to_email or detail["student_email"]
@@ -6431,7 +6454,8 @@ def _maybe_email_invoice(db, inv, kind, to_email=None, do_send=True):
 def _send_attendance_email(db, student_id: int, occ: "ClassOccurrence", status: str, notes: Optional[str]):
     """Notify a student's guardian when attendance is marked present/absent —
     gated by the 'attendance' notification category."""
-    if not _notif_enabled(db, "attendance"):
+    _occ_center = occ.template.center_id if occ.template else None
+    if not _notif_enabled(db, "attendance", _occ_center):
         return False
     student = db.query(Student).filter(Student.id == student_id).first()
     to = (student.guardian_email or student.email) if student else None
@@ -6442,7 +6466,7 @@ def _send_attendance_email(db, student_id: int, occ: "ClassOccurrence", status: 
     center_id = t.center_id if t else None
     brand = _org_brand(db, center_id)
     kind = "attendance_present" if status == "present" else "attendance_absent"
-    tpl = _notif_template(db, kind)
+    tpl = _notif_template(db, kind, center_id)
     ctx = {
         "academy": brand["academy_name"],
         "student_name": f"{student.first_name} {student.last_name}",
@@ -6477,7 +6501,7 @@ def _send_class_reminder_email(db, student, occ: "ClassOccurrence", teacher):
     t = occ.template
     center_id = t.center_id if t else None
     brand = _org_brand(db, center_id)
-    tpl = _notif_template(db, "class_reminder")
+    tpl = _notif_template(db, "class_reminder", center_id)
     ctx = {
         "academy": brand["academy_name"],
         "student_name": f"{student.first_name} {student.last_name}",
@@ -6510,13 +6534,13 @@ async def send_class_reminder(occ_id: int, request: Request, db: Session = Depen
     """Manually send a class reminder to the roster (or a subset) of one
     occurrence. body: { student_ids?: [int] } — omit to send to everyone
     currently rostered for this class."""
-    if not _notif_enabled(db, "class_reminders"):
-        raise HTTPException(status_code=400,
-            detail="Class reminder emails are turned off in Settings → Email Notifications.")
     o = db.query(ClassOccurrence).filter(ClassOccurrence.id == occ_id).first()
     if not o:
         raise HTTPException(status_code=404, detail="Occurrence not found")
     _check_scheduling_access(current, o.template.center_id if o.template else None)
+    if not _notif_enabled(db, "class_reminders", o.template.center_id if o.template else None):
+        raise HTTPException(status_code=400,
+            detail="Class reminder emails are turned off in Settings → Email Notifications.")
     body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
     target_ids = body.get("student_ids")
     roster_ids = _occurrence_roster_ids(db, o) if o.template_id else set()
@@ -7079,18 +7103,27 @@ _ORG_KEYS = ["academy_name", "gst_number", "address", "phone", "email", "website
 
 # ── Email notification settings (master switch + per-category toggles + templates) ──
 
+def _notif_scope(current: dict, center_id: Optional[int]) -> Optional[int]:
+    """center_admin is locked to their own center; super_admin may target a
+    center (its own overrides) or None (the global default every center inherits)."""
+    own = _caller_center_id(current)
+    return own if own is not None else (center_id or None)
+
+
 @app.get("/admin/notification-settings")
-def get_notification_settings(db: Session = Depends(get_db),
-                              current = Depends(require_roles("super_admin"))):
-    return _notif_settings(db)
+def get_notification_settings(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                              current = Depends(require_roles("super_admin", "center_admin"))):
+    return _notif_settings(db, _notif_scope(current, center_id))
 
 
 @app.put("/admin/notification-settings")
-async def put_notification_settings(request: Request, db: Session = Depends(get_db),
-                                    current = Depends(require_roles("super_admin"))):
+async def put_notification_settings(request: Request, center_id: Optional[int] = None,
+                                    db: Session = Depends(get_db),
+                                    current = Depends(require_roles("super_admin", "center_admin"))):
     """body: { master?: bool, class_reminders?: bool, attendance?: bool, invoices?: bool, activation?: bool }"""
     body = await request.json()
-    fields = {"master": "notif.enabled.master", **{c: f"notif.enabled.{c}" for c in NOTIF_CATEGORIES}}
+    cid = _notif_scope(current, center_id)
+    fields = {"master": _notif_key(cid, "enabled.master"), **{c: _notif_key(cid, f"enabled.{c}") for c in NOTIF_CATEGORIES}}
     for field, key in fields.items():
         if field in body:
             value = "true" if body[field] else "false"
@@ -7100,26 +7133,29 @@ async def put_notification_settings(request: Request, db: Session = Depends(get_
             else:
                 db.add(AppSetting(key=key, value=value))
     db.commit()
-    return _notif_settings(db)
+    return _notif_settings(db, cid)
 
 
 @app.get("/admin/notification-templates")
-def get_notification_templates(db: Session = Depends(get_db),
-                               current = Depends(require_roles("super_admin"))):
-    return {kind: _notif_template(db, kind) for kind in NOTIF_TEMPLATE_DEFAULTS}
+def get_notification_templates(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                               current = Depends(require_roles("super_admin", "center_admin"))):
+    cid = _notif_scope(current, center_id)
+    return {kind: _notif_template(db, kind, cid) for kind in NOTIF_TEMPLATE_DEFAULTS}
 
 
 @app.put("/admin/notification-templates/{kind}")
-async def put_notification_template(kind: str, request: Request, db: Session = Depends(get_db),
-                                    current = Depends(require_roles("super_admin"))):
+async def put_notification_template(kind: str, request: Request, center_id: Optional[int] = None,
+                                    db: Session = Depends(get_db),
+                                    current = Depends(require_roles("super_admin", "center_admin"))):
     """body: { subject?, heading?, intro?, button_label? } — only fields the
     template actually has (see NOTIF_TEMPLATE_DEFAULTS) are accepted."""
     if kind not in NOTIF_TEMPLATE_DEFAULTS:
         raise HTTPException(status_code=404, detail="Unknown template")
     body = await request.json()
+    cid = _notif_scope(current, center_id)
     for field in NOTIF_TEMPLATE_DEFAULTS[kind]:
         if field in body:
-            key = f"notif.template.{kind}.{field}"
+            key = _notif_key(cid, f"template.{kind}.{field}")
             value = body[field]
             row = db.query(AppSetting).filter(AppSetting.key == key).first()
             if row:
@@ -7127,18 +7163,20 @@ async def put_notification_template(kind: str, request: Request, db: Session = D
             else:
                 db.add(AppSetting(key=key, value=value))
     db.commit()
-    return _notif_template(db, kind)
+    return _notif_template(db, kind, cid)
 
 
 @app.post("/admin/notification-templates/{kind}/reset")
-def reset_notification_template(kind: str, db: Session = Depends(get_db),
-                                current = Depends(require_roles("super_admin"))):
-    """Delete any saved override so the template falls back to the built-in default."""
+def reset_notification_template(kind: str, center_id: Optional[int] = None, db: Session = Depends(get_db),
+                                current = Depends(require_roles("super_admin", "center_admin"))):
+    """Delete this scope's saved override so the template falls back to the
+    inherited default (global for a center, built-in for global)."""
     if kind not in NOTIF_TEMPLATE_DEFAULTS:
         raise HTTPException(status_code=404, detail="Unknown template")
-    db.query(AppSetting).filter(AppSetting.key.like(f"notif.template.{kind}.%")).delete(synchronize_session=False)
+    cid = _notif_scope(current, center_id)
+    db.query(AppSetting).filter(AppSetting.key.like(f"{_notif_key(cid, f'template.{kind}.')}%")).delete(synchronize_session=False)
     db.commit()
-    return _notif_template(db, kind)
+    return _notif_template(db, kind, cid)
 
 
 @app.get("/admin/org-settings")

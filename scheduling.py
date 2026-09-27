@@ -21,18 +21,18 @@ CODE_TO_IDX = {c: i for i, c in enumerate(WEEKDAY_CODES)}
 HORIZON_DAYS = int(os.getenv("OCCURRENCE_HORIZON_DAYS", "365"))
 
 
-def get_horizon_days(db: Session) -> int:
+def get_horizon_days(db: Session, center_id: Optional[int] = None) -> int:
     """How far ahead (in days) recurring classes get pre-generated into
-    class_occurrences — admin-editable (Settings → Scheduling) so an academy
-    can trade off "how far ahead can I see/manage my calendar" against
-    database row growth as it scales up. Falls back to the env var default
-    when nothing's been configured yet."""
-    row = db.query(AppSetting).filter(AppSetting.key == "occurrence_horizon_days").first()
-    if row and row.value:
-        try:
-            return max(30, int(row.value))
-        except ValueError:
-            pass
+    class_occurrences. A center's own setting wins, then the super_admin's
+    global default, then the env default."""
+    keys = ([f"center_{center_id}_scheduling.occurrence_horizon_days"] if center_id else []) + ["occurrence_horizon_days"]
+    for key in keys:
+        row = db.query(AppSetting).filter(AppSetting.key == key).first()
+        if row and row.value:
+            try:
+                return max(30, int(row.value))
+            except ValueError:
+                continue
     return HORIZON_DAYS
 
 
@@ -163,7 +163,7 @@ def generate_for_template(db: Session, template: ClassTemplate, *,
         return 0
     fd = _parse(from_date) if from_date else None
     holidays = holiday_dates_for(db, template.center_id)
-    wanted = expand_occurrences(rule, from_date=fd, holiday_dates=holidays, horizon_days=get_horizon_days(db))
+    wanted = expand_occurrences(rule, from_date=fd, holiday_dates=holidays, horizon_days=get_horizon_days(db, template.center_id))
     wanted_set = {_fmt(d) for d in wanted}
 
     existing = db.query(ClassOccurrence).filter(

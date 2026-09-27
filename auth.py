@@ -242,31 +242,46 @@ NOTIF_TEMPLATE_DEFAULTS = {
 }
 
 
-def _notif_settings(db: Session) -> dict:
-    rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like("notif.enabled.%")).all()}
+def _notif_key(center_id: Optional[int], suffix: str) -> str:
+    return f"center_{center_id}_notif.{suffix}" if center_id else f"notif.{suffix}"
+
+
+def _notif_rows(db: Session, center_id: Optional[int], suffix_prefix: str) -> dict:
+    """Return {suffix: value}, global rows overlaid by this center's own rows —
+    a center's explicit choice wins; anything it hasn't set inherits the
+    super_admin's global default."""
+    out = {}
+    for cid in ([None, center_id] if center_id else [None]):
+        prefix = _notif_key(cid, suffix_prefix)
+        for r in db.query(AppSetting).filter(AppSetting.key.like(f"{prefix}%")).all():
+            out[r.key[len(prefix):]] = r.value
+    return out
+
+
+def _notif_settings(db: Session, center_id: Optional[int] = None) -> dict:
+    rows = _notif_rows(db, center_id, "enabled.")
     return {
-        "master": (rows.get("notif.enabled.master", "true") == "true"),
-        **{c: (rows.get(f"notif.enabled.{c}", str(NOTIF_CATEGORY_DEFAULTS[c]).lower()) == "true")
+        "master": (rows.get("master", "true") == "true"),
+        **{c: (rows.get(c, str(NOTIF_CATEGORY_DEFAULTS[c]).lower()) == "true")
            for c in NOTIF_CATEGORIES},
     }
 
 
-def _notif_enabled(db: Session, category: str) -> bool:
-    s = _notif_settings(db)
+def _notif_enabled(db: Session, category: str, center_id: Optional[int] = None) -> bool:
+    s = _notif_settings(db, center_id)
     return s["master"] and s.get(category, False)
 
 
-def _notif_template(db: Session, kind: str) -> dict:
+def _notif_template(db: Session, kind: str, center_id: Optional[int] = None) -> dict:
     defaults = NOTIF_TEMPLATE_DEFAULTS[kind]
-    rows = {r.key: r.value for r in db.query(AppSetting).filter(AppSetting.key.like(f"notif.template.{kind}.%")).all()}
-    return {field: rows.get(f"notif.template.{kind}.{field}") or default
-            for field, default in defaults.items()}
+    rows = _notif_rows(db, center_id, f"template.{kind}.")
+    return {field: rows.get(field) or default for field, default in defaults.items()}
 
 
 def _send_activation_email(db: Session, to: str, name: str, raw_token: str, center_id: Optional[int] = None):
     link = f"{FRONTEND_URL}/activate?token={raw_token}"
     brand = _org_brand(db, center_id)
-    tpl = _notif_template(db, "activation")
+    tpl = _notif_template(db, "activation", center_id)
     ctx = {"academy": brand["academy_name"], "name": name}
     html = _branded_email_html(
         academy=brand["academy_name"], logo_url=brand["logo_url"],
@@ -282,7 +297,7 @@ def _send_activation_email(db: Session, to: str, name: str, raw_token: str, cent
 def _send_reset_email(db: Session, to: str, name: str, raw_token: str, center_id: Optional[int] = None):
     link = f"{FRONTEND_URL}/reset-password?token={raw_token}"
     brand = _org_brand(db, center_id)
-    tpl = _notif_template(db, "password_reset")
+    tpl = _notif_template(db, "password_reset", center_id)
     ctx = {"academy": brand["academy_name"], "name": name}
     html = _branded_email_html(
         academy=brand["academy_name"], logo_url=brand["logo_url"],
@@ -425,7 +440,7 @@ def provision_account(db: Session, subject_type: str, obj, *, actor=None,
         # The activation-email toggle only applies to students (item 5 of the
         # notification settings) — staff accounts always get theirs, since
         # that's an internal admin action, not a family-facing notification.
-        if subject_type != "student" or _notif_enabled(db, "activation"):
+        if subject_type != "student" or _notif_enabled(db, "activation", getattr(obj, "center_id", None)):
             _send_activation_email(db, deliver_to, display_name(subject_type, obj), activation_token,
                                    center_id=getattr(obj, "center_id", None))
     return activation_token
