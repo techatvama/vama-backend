@@ -4181,6 +4181,15 @@ async def update_staff(staff_id: int, request: Request, db: Session = Depends(ge
             and db_staff.center_id != current["obj"].center_id):
         raise HTTPException(status_code=403, detail="Cannot edit another center's staff")
 
+    if "email" in body:
+        new_email = (body["email"] or "").strip()
+        if not new_email:
+            raise HTTPException(status_code=400, detail="Email cannot be empty")
+        dupe = db.query(Staff).filter(Staff.email.ilike(new_email), Staff.id != staff_id).first()
+        if dupe:
+            raise HTTPException(status_code=400, detail="Another staff account already uses this email")
+        body["email"] = new_email
+
     for field, col in [
         ("name", "name"), ("role", "role"), ("phone", "phone"),
         ("email", "email"), ("calendar", "calendar"),
