@@ -628,7 +628,7 @@ async def teacher_login(request: Request, db: Session = Depends(get_db)):
 def get_students(center_id: Optional[int] = None, page: Optional[int] = None, limit: int = 50,
                 exclude_dropped: bool = False,
                 db: Session = Depends(get_db),
-                current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+                current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     """List all students, optionally filtered by center. Phase 6: Paginated if page param provided.
 
     exclude_dropped=true — used by booking/roster pickers so dropped students
@@ -688,7 +688,7 @@ def get_students(center_id: Optional[int] = None, page: Optional[int] = None, li
 
 @app.get("/admin/students-overview")
 def admin_students_overview(center_id: Optional[int] = None, db: Session = Depends(get_db),
-                            current=Depends(require_roles("super_admin", "center_admin", "teacher"))):
+                            current=Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     """Enriched roster for the Enrollment Manager: each student with assigned
     instructor, curriculum, exam status, a live progress %, and a 'portal_ready'
     flag (instrument + instructor set → packages/booking unlock in their portal).
@@ -3490,7 +3490,7 @@ def _grade_dict(g: "Grade") -> dict:
 
 @app.get("/admin/grades")
 def get_grades(center_id: Optional[int] = None, db: Session = Depends(get_db),
-               current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+               current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     own_center = _caller_center_id(current)
     q = db.query(Grade)
     if own_center is not None:
@@ -3577,7 +3577,7 @@ def _subject_dict(s: "Subject") -> dict:
 @app.get("/admin/subjects")
 def get_subjects(include_inactive: bool = False, center_id: Optional[int] = None,
                  db: Session = Depends(get_db),
-                 current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+                 current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     own_center = _caller_center_id(current)
     query = db.query(Subject)
     if own_center is not None:
@@ -3667,7 +3667,7 @@ def _exam_session_dict(e: "ExamSession") -> dict:
 
 @app.get("/admin/exam-sessions")
 def get_exam_sessions(center_id: Optional[int] = None, db: Session = Depends(get_db),
-                      current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+                      current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     own_center = _caller_center_id(current)
     q = db.query(ExamSession)
     if own_center is not None:
@@ -3744,7 +3744,7 @@ def delete_exam_session(session_id: int, db: Session = Depends(get_db),
 @app.get("/admin/dashboard/stats")
 def admin_dashboard_stats(
     db: Session = Depends(get_db),
-    current=Depends(require_roles("super_admin", "center_admin", "teacher")),
+    current=Depends(require_roles("super_admin", "center_admin", "teacher", "staff")),
 ):
     """Aggregated counts for the curriculum dashboard, scoped to caller's center."""
     from models import Grade, Subject, ExamSession, Syllabus
@@ -3815,7 +3815,7 @@ def list_syllabi(
     grade_id: Optional[int] = None,
     center_id: Optional[int] = None,
     db: Session = Depends(get_db),
-    current = Depends(require_roles("super_admin", "center_admin", "teacher")),
+    current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff")),
 ):
     own_center = _caller_center_id(current)
     q = db.query(Syllabus)
@@ -3841,7 +3841,7 @@ def list_syllabi(
 
 @app.get("/admin/syllabi/{syllabus_id}")
 def get_syllabus(syllabus_id: int, db: Session = Depends(get_db),
-                 current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+                 current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     s = db.query(Syllabus).filter(Syllabus.id == syllabus_id).first()
     if not s:
         raise HTTPException(status_code=404, detail="Syllabus not found")
@@ -4244,7 +4244,7 @@ async def toggle_staff_calendar(staff_id: int, enabled: bool, db: Session = Depe
 
 @app.get("/batches")
 def get_batches(center_id: Optional[int] = None, db: Session = Depends(get_db),
-               current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+               current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     q = db.query(Batch)
     # Phase 1A: Center admin only sees their center's batches
     if current.get("obj").access_role == "center_admin" and current.get("obj").center_id:
@@ -5235,7 +5235,7 @@ async def create_template(request: Request, db: Session = Depends(get_db),
 @app.get("/scheduling/templates")
 def list_templates(center_id: Optional[int] = None, page: Optional[int] = None, limit: int = 50,
                   db: Session = Depends(get_db),
-                  current = Depends(require_roles("super_admin", "center_admin", "teacher"))):
+                  current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff"))):
     """List class templates. Phase 6: Paginated if page param provided, else returns array."""
     q = db.query(ClassTemplate).filter(ClassTemplate.status == "active")
     # Phase 1A: Center admin only sees their center's templates
@@ -5773,7 +5773,7 @@ def scheduling_calendar(
     room_id: Optional[int] = None, student_id: Optional[int] = None,
     include_roster: bool = False,
     db: Session = Depends(get_db),
-    current = Depends(require_roles("super_admin", "center_admin", "teacher", "student")),
+    current = Depends(require_roles("super_admin", "center_admin", "teacher", "staff", "student")),
 ):
     # Lock center admins/teachers to their own center — a client-supplied
     # center_id must never override this, or a center_admin could simply
