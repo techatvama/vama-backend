@@ -4384,7 +4384,10 @@ def enroll_student_in_session(
 ):
     from datetime import datetime as _dt
 
-    sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
+    # A session_id may address a legacy ClassSession or a v2 ClassOccurrence
+    # (ids are shared/mirrored) — nearly every class today is the latter, so
+    # without this fallback every enroll attempt 404'd for a real class.
+    sess = _resolve_session_or_occurrence(db, session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
     _check_scheduling_access(current, _session_center_id(sess))
@@ -4395,7 +4398,7 @@ def enroll_student_in_session(
     # package gate below so a previously paused package is active again.
     _reactivate_student_if_needed(db, student_id)
 
-    if enrollment_type == "recurring" and sess.batch_id:
+    if enrollment_type == "recurring" and getattr(sess, "batch_id", None):
         # Find all sessions in this batch that share the SAME weekday AND start_time
         try:
             target_weekday = _dt.strptime(sess.date, "%Y-%m-%d").weekday()
@@ -4470,12 +4473,12 @@ def remove_student_from_session(
 ):
     from datetime import datetime as _dt
 
-    sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
+    sess = _resolve_session_or_occurrence(db, session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
     _check_scheduling_access(current, _session_center_id(sess))
 
-    if scope == "all_classes" and sess.batch_id:
+    if scope == "all_classes" and getattr(sess, "batch_id", None):
         # Remove from all sessions in this batch that share the same weekday + time
         try:
             target_weekday = _dt.strptime(sess.date, "%Y-%m-%d").weekday()
