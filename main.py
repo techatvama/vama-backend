@@ -4173,6 +4173,13 @@ async def update_staff(staff_id: int, request: Request, db: Session = Depends(ge
     db_staff = db.query(Staff).filter(Staff.id == staff_id).first()
     if not db_staff:
         raise HTTPException(status_code=404, detail="Staff not found")
+    # A center_admin may edit their own account or any staff member in their
+    # own center — without this, they could rewrite another center's staff
+    # (email/password included) just by id.
+    if (current.get("obj").access_role == "center_admin"
+            and staff_id != current["id"]
+            and db_staff.center_id != current["obj"].center_id):
+        raise HTTPException(status_code=403, detail="Cannot edit another center's staff")
 
     for field, col in [
         ("name", "name"), ("role", "role"), ("phone", "phone"),
