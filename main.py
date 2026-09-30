@@ -8712,6 +8712,139 @@ async def update_center(center_id: int, request: Request, db: Session = Depends(
     return {"message": "Updated"}
 
 
+def _center_delete_preview(db: Session, center_id: int) -> dict:
+    """Row counts across every table that will be wiped, so the confirmation
+    dialog can show an admin exactly what they're about to lose."""
+    counts = {}
+    for label, sql in [
+        ("students", "SELECT COUNT(*) FROM students WHERE center_id = :cid"),
+        ("staff", "SELECT COUNT(*) FROM staff WHERE center_id = :cid"),
+        ("invoices", "SELECT COUNT(*) FROM invoices WHERE center_id = :cid"),
+        ("class_templates", "SELECT COUNT(*) FROM class_templates WHERE center_id = :cid"),
+        ("syllabi", "SELECT COUNT(*) FROM syllabi WHERE center_id = :cid"),
+    ]:
+        counts[label] = db.execute(text(sql), {"cid": center_id}).scalar() or 0
+    row = db.execute(text(
+        "SELECT COALESCE(SUM(total_amount),0), COALESCE(SUM(paid_amount),0) "
+        "FROM invoices WHERE center_id = :cid"), {"cid": center_id}).first()
+    counts["total_billed"] = float(row[0]) if row else 0
+    counts["total_paid"] = float(row[1]) if row else 0
+    return counts
+
+
+def _hard_delete_center(db: Session, center_id: int) -> None:
+    """Permanently delete a center and every row anywhere in the database
+    that transitively depends on it (its staff, its students, and
+    everything under them — classes, attendance, invoices, curriculum,
+    settings, ...). Driven by the database's own live foreign-key graph
+    rather than a hand-maintained table list, so it can't silently miss a
+    table (including legacy ones the app no longer writes to but that
+    still carry an FK). Irreversible."""
+    from collections import defaultdict
+    center_id = int(center_id)
+
+    edges = db.execute(text("""
+        SELECT conrelid::regclass::text AS child, a.attname AS child_col,
+               confrelid::regclass::text AS parent, af.attname AS parent_col
+        FROM pg_constraint c
+        JOIN unnest(c.conkey) WITH ORDINALITY AS ck(attnum, ord) ON true
+        JOIN unnest(c.confkey) WITH ORDINALITY AS cfk(attnum, ord) ON cfk.ord = ck.ord
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ck.attnum
+        JOIN pg_attribute af ON af.attrelid = c.confrelid AND af.attnum = cfk.attnum
+        WHERE c.contype = 'f'
+    """)).fetchall()
+
+    children_of = defaultdict(list)
+    for e in edges:
+        if e.child == e.parent:
+            continue  # self-referencing FK (e.g. class_templates.parent_template_id) — cleared separately below
+        children_of[e.parent].append((e.child, e.child_col, e.parent_col))
+
+    roots = {"centers": f"id = {center_id}", "staff": f"center_id = {center_id}", "students": f"center_id = {center_id}"}
+    where_for = dict(roots)
+    discovery_order = []
+    frontier = list(roots.keys())
+    i = 0
+    while i < len(frontier):
+        parent = frontier[i]; i += 1
+        for child, child_col, parent_col in children_of.get(parent, []):
+            clause = f'"{child_col}" IN (SELECT "{parent_col}" FROM "{parent}" WHERE {where_for[parent]})'
+            if child in where_for:
+                where_for[child] += f" OR {clause}"
+            else:
+                where_for[child] = clause
+                discovery_order.append(child)
+            if child not in frontier:
+                frontier.append(child)
+
+    # Deletion must go children-before-parents. discovery_order is in
+    # parents-before-children order (BFS from the roots); resolve the exact
+    # reverse order with a topological sort over the discovered edges so a
+    # table is only deleted once nothing left standing still references it.
+    child_map = defaultdict(set)
+    all_tables = set(discovery_order)
+    for parent, children in children_of.items():
+        for child, _, _ in children:
+            if child in all_tables and parent in all_tables | set(roots):
+                child_map[parent].add(child)
+    remaining = set(discovery_order)
+    deletion_order = []
+    guard = 0
+    while remaining and guard < 500:
+        guard += 1
+        ready = [t for t in remaining if not (child_map.get(t, set()) & remaining)]
+        if not ready:
+            ready = list(remaining)  # break any residual cycle rather than hang
+        for t in sorted(ready):
+            deletion_order.append(t)
+            remaining.discard(t)
+
+    # Clear the one self-referencing FK before its table gets deleted.
+    db.execute(text(
+        'UPDATE class_templates SET parent_template_id = NULL '
+        f'WHERE {where_for.get("class_templates", "1=0")}'
+    )) if "class_templates" in where_for else None
+
+    for table in deletion_order:
+        db.execute(text(f'DELETE FROM "{table}" WHERE {where_for[table]}'))
+    db.execute(text(f'DELETE FROM "app_settings" WHERE key LIKE :prefix'), {"prefix": f"center_{center_id}_%"})
+    db.execute(text('DELETE FROM "students" WHERE center_id = :cid'), {"cid": center_id})
+    db.execute(text('DELETE FROM "staff" WHERE center_id = :cid'), {"cid": center_id})
+    db.execute(text('DELETE FROM "centers" WHERE id = :cid'), {"cid": center_id})
+
+
+@app.get("/centers/{center_id}/delete-preview")
+def preview_center_deletion(center_id: int, db: Session = Depends(get_db),
+                            current = Depends(require_roles("super_admin"))):
+    c = db.query(Center).filter(Center.id == center_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Center not found")
+    return {"center": {"id": c.id, "name": c.name}, **_center_delete_preview(db, center_id)}
+
+
+@app.delete("/centers/{center_id}")
+async def delete_center(center_id: int, request: Request, db: Session = Depends(get_db),
+                        current = Depends(require_roles("super_admin"))):
+    """Permanently delete a center — hard delete, not deactivation. Requires
+    the caller to re-type the center's exact name as confirmation. Irreversible."""
+    c = db.query(Center).filter(Center.id == center_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Center not found")
+    body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
+    if (body.get("confirm_name") or "").strip() != c.name:
+        raise HTTPException(status_code=400, detail="Type the center's exact name to confirm deletion")
+
+    snapshot = {"center_id": center_id, "name": c.name, **_center_delete_preview(db, center_id)}
+    try:
+        _hard_delete_center(db, center_id)
+        audit(db, "center.deleted", subject=("staff", current["id"]), request=request, detail=snapshot)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Delete failed, nothing was removed: {e}")
+    return {"message": "Center permanently deleted", **snapshot}
+
+
 @app.put("/admin/staff/{staff_id}/access")
 async def update_staff_access(staff_id: int, request: Request, db: Session = Depends(get_db),
                              current = Depends(require_roles("super_admin"))):
