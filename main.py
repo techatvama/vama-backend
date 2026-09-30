@@ -259,6 +259,10 @@ def _run_migrations():
         "ALTER TABLE subjects ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
         "ALTER TABLE grades ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
         "ALTER TABLE exam_sessions ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        # ── Grade history needs to be per-subject once a student can take more
+        # than one instrument (LearningEnrollment) — NULL means a legacy/
+        # single-subject change made before this column existed. ──
+        "ALTER TABLE student_grade_history ADD COLUMN IF NOT EXISTS subject VARCHAR",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -974,6 +978,27 @@ async def update_student_instructor(student_id: int, track_id: int, request: Req
     exam_session = db.query(ExamSession).filter(ExamSession.id == exam_session_id).first() if exam_session_id else None
     exam_date = exam_session.exam_date.isoformat() if (exam_session and exam_session.exam_date) else None
 
+    if enroll and enroll.grade != grade:
+        db.add(StudentGradeHistory(
+            student_id=student_id,
+            subject=subject or None,
+            from_grade=enroll.grade,
+            to_grade=grade,
+            change_type="manual",
+            changed_by=body.get("changed_by") or "",
+            notes=body.get("grade_change_notes"),
+        ))
+    elif not enroll and grade:
+        db.add(StudentGradeHistory(
+            student_id=student_id,
+            subject=subject or None,
+            from_grade=None,
+            to_grade=grade,
+            change_type="manual",
+            changed_by=body.get("changed_by") or "",
+            notes=body.get("grade_change_notes"),
+        ))
+
     if enroll:
         enroll.teacher_id = ti.teacher_id
         enroll.grade = grade
@@ -1118,6 +1143,7 @@ async def update_student(student_id: int, request: Request, db: Session = Depend
             changed_by = body.get("changed_by") or current.get("name") or current.get("email", "")
             db.add(StudentGradeHistory(
                 student_id=student.id,
+                subject=student.instrument or None,
                 from_grade=old_grade,
                 to_grade=new_grade,
                 change_type="manual",
@@ -2497,13 +2523,15 @@ async def update_student_progress(
 
 
 @app.get("/students/{student_id}/grade-history")
-def get_grade_history(student_id: int, db: Session = Depends(get_db)):
-    history = db.query(StudentGradeHistory).filter(
-        StudentGradeHistory.student_id == student_id
-    ).order_by(StudentGradeHistory.changed_at.desc()).all()
+def get_grade_history(student_id: int, subject: Optional[str] = None, db: Session = Depends(get_db)):
+    q = db.query(StudentGradeHistory).filter(StudentGradeHistory.student_id == student_id)
+    if subject:
+        q = q.filter(StudentGradeHistory.subject == subject)
+    history = q.order_by(StudentGradeHistory.changed_at.desc()).all()
     return [
         {
             "id": h.id,
+            "subject": h.subject,
             "from_grade": h.from_grade,
             "to_grade": h.to_grade,
             "change_type": h.change_type,
@@ -2512,6 +2540,69 @@ def get_grade_history(student_id: int, db: Session = Depends(get_db)):
             "changed_at": h.changed_at.isoformat() if h.changed_at else None,
         }
         for h in history
+    ]
+
+
+@app.get("/admin/students/{student_id}/feedback-history")
+def get_student_feedback_history(
+    student_id: int, subject: Optional[str] = None, limit: int = 30,
+    db: Session = Depends(get_db),
+    current = Depends(require_roles("super_admin", "center_admin", "staff")),
+):
+    """Chronological feed of real teacher feedback (the notes a teacher
+    leaves when marking attendance) — this is the actual source of the
+    'Recent Feedback' the admin profile shows, not a separate rating system."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if current.get("obj").access_role != "super_admin" and student.center_id != current["obj"].center_id:
+        raise HTTPException(status_code=403, detail="Cannot view another center's student")
+
+    # Scan the most recent notes-bearing attendance rows, then filter by
+    # subject in Python (subject lives on the session's Batch/ClassTemplate,
+    # not on Attendance itself) — capped well above `limit` so a subject
+    # filter still has enough rows to page through.
+    rows = db.query(Attendance).filter(
+        Attendance.student_id == student_id,
+        Attendance.notes.isnot(None),
+        Attendance.notes != "",
+    ).order_by(Attendance.marked_at.desc()).limit(max(limit, 30) * 5).all()
+
+    session_ids = {r.session_id for r in rows}
+    sessions_by_id = {}
+    if session_ids:
+        for s in db.query(ClassSession).filter(ClassSession.id.in_(session_ids)).all():
+            sessions_by_id[s.id] = s
+        missing = session_ids - set(sessions_by_id)
+        if missing:
+            for o in db.query(ClassOccurrence).filter(ClassOccurrence.id.in_(missing)).all():
+                sessions_by_id[o.id] = o
+
+    teacher_ids = set()
+    matched = []
+    for r in rows:
+        subj, teacher_id, date = _session_subject_teacher(sessions_by_id.get(r.session_id))
+        if subject and subj != subject:
+            continue
+        if teacher_id:
+            teacher_ids.add(teacher_id)
+        matched.append((r, subj, teacher_id, date))
+        if len(matched) >= limit:
+            break
+
+    teachers = {t.id: t.name for t in db.query(Staff).filter(Staff.id.in_(teacher_ids or [-1])).all()}
+
+    return [
+        {
+            "id": r.id,
+            "subject": subj,
+            "teacher": teachers.get(teacher_id),
+            "status": r.status,
+            "notes": r.notes,
+            "date": date,
+            "marked_at": r.marked_at.isoformat() if r.marked_at else None,
+        }
+        for r, subj, teacher_id, date in matched
     ]
 
 
@@ -2541,6 +2632,7 @@ async def promote_student_grade(
     student.current_grade = to_grade
     db.add(StudentGradeHistory(
         student_id=student.id,
+        subject=student.instrument or None,
         from_grade=old_grade,
         to_grade=to_grade,
         change_type="auto_promote",
@@ -4840,6 +4932,20 @@ def _session_center_id(session_obj) -> Optional[int]:
     if hasattr(session_obj, "template"):        # ClassOccurrence
         return session_obj.template.center_id if session_obj.template else None
     return None
+
+
+def _session_subject_teacher(session_obj):
+    """(subject, teacher_id, date) for either a legacy ClassSession (via its
+    Batch) or a v2 ClassOccurrence (via its ClassTemplate)."""
+    if session_obj is None:
+        return None, None, None
+    if hasattr(session_obj, "batch"):           # ClassSession
+        b = session_obj.batch
+        return (b.subject if b else None), session_obj.teacher_id, session_obj.date
+    if hasattr(session_obj, "template"):         # ClassOccurrence
+        t = session_obj.template
+        return (t.course if t else None), session_obj.teacher_id, session_obj.date
+    return None, None, None
 
 
 def _resolve_session_or_occurrence(db, session_id: int):

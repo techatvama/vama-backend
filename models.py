@@ -230,6 +230,7 @@ class StudentGradeHistory(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    subject = Column(String, nullable=True)      # None = legacy/single-subject change
     from_grade = Column(String, nullable=True)   # None for the very first assignment
     to_grade = Column(String, nullable=False)
     change_type = Column(String, default="manual")  # "manual" | "auto_promote"
