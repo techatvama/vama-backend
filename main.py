@@ -8129,9 +8129,11 @@ def admin_reports(period: str = "month", center_id: Optional[int] = None, db: Se
 
 
 @app.get("/admin/payment-dashboard")
-def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
+def payment_dashboard(period: str = "month", db: Session = Depends(get_db),
+                      current = Depends(require_roles("super_admin", "center_admin", "staff"))):
     from datetime import datetime as _dt, timedelta as _td
 
+    center_id = _caller_center_id(current)
     now = _dt.utcnow()
 
     # ── time-range start date string (YYYY-MM-DD), plus the equal-length prior
@@ -8169,11 +8171,23 @@ def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
             return None
         return round((cur - prev) / prev * 100, 1)
 
-    # ── pre-fetch everything once ──────────────────────────────────────────────
-    all_invoices   = db.query(Invoice).order_by(Invoice.id.desc()).all()
-    all_subs       = db.query(Subscription).all()
-    all_packages   = db.query(Package).filter(Package.is_archived == False).all()
-    students_map   = {s.id: s for s in db.query(Student).all()}
+    # ── pre-fetch everything once, scoped to the caller's center (None =
+    # super_admin, unrestricted). Invoice/Subscription/StudentPackage have no
+    # center_id of their own — they're scoped via their student's center. ──
+    student_q = db.query(Student)
+    if center_id is not None:
+        student_q = student_q.filter(Student.center_id == center_id)
+    students_map = {s.id: s for s in student_q.all()}
+    student_ids = set(students_map.keys())
+
+    invoice_q = db.query(Invoice).order_by(Invoice.id.desc())
+    sub_q = db.query(Subscription)
+    if center_id is not None:
+        invoice_q = invoice_q.filter(Invoice.student_id.in_(student_ids or [-1]))
+        sub_q = sub_q.filter(Subscription.student_id.in_(student_ids or [-1]))
+    all_invoices   = invoice_q.all()
+    all_subs       = sub_q.all()
+    all_packages   = db.query(Package).filter(Package.is_archived == False).all()  # shared catalog, not center data
 
     # ── KPI slice (time-filtered) ──────────────────────────────────────────────
     kpi_invs = (
@@ -8323,7 +8337,10 @@ def payment_dashboard(period: str = "month", db: Session = Depends(get_db)):
 
     # ── real session utilization — live from attendance via StudentPackage,
     # not the Subscription.sessions_used counter (which nothing ever updates). ─
-    active_packages = db.query(StudentPackage).filter(StudentPackage.status == "active").all()
+    active_pkg_q = db.query(StudentPackage).filter(StudentPackage.status == "active")
+    if center_id is not None:
+        active_pkg_q = active_pkg_q.filter(StudentPackage.student_id.in_(student_ids or [-1]))
+    active_packages = active_pkg_q.all()
     pkg_states = [resolve_package_state(db, sp) for sp in active_packages]
     sessions_total_live = sum(st["sessions_total"] for st in pkg_states if st)
     sessions_used_live  = sum(st["sessions_used"]  for st in pkg_states if st)
