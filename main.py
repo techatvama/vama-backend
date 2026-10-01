@@ -263,6 +263,10 @@ def _run_migrations():
         # than one instrument (LearningEnrollment) — NULL means a legacy/
         # single-subject change made before this column existed. ──
         "ALTER TABLE student_grade_history ADD COLUMN IF NOT EXISTS subject VARCHAR",
+        # ── Fee packages are per-center, not a shared catalog — NULL means a
+        # pre-migration package not yet assigned to a center (see one-off
+        # backfill run alongside this migration). ──
+        "ALTER TABLE packages ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -904,7 +908,7 @@ async def add_student_instructor(student_id: int, request: Request, db: Session 
         LearningEnrollment.subject == (instrument or ""),
     ).first()
 
-    fee_package_id = body.get("fee_package_id") or _enrollment_module._auto_package(db, instrument or "", grade)
+    fee_package_id = body.get("fee_package_id") or _enrollment_module._auto_package(db, instrument or "", grade, student.center_id)
 
     if enroll:
         enroll.teacher_id = teacher_id
@@ -969,7 +973,9 @@ async def update_student_instructor(student_id: int, track_id: int, request: Req
     grade = body.get("grade", enroll.grade if enroll else "Debut")
     syllabus_type = body.get("syllabus_type", enroll.syllabus_type if enroll else "Trinity")
     is_exam_student = body.get("is_exam_student", enroll.is_exam_student if enroll else False)
-    fee_package_id = body.get("fee_package_id") or _enrollment_module._auto_package(db, subject, grade)
+    _track_student = db.query(Student).filter(Student.id == student_id).first()
+    fee_package_id = body.get("fee_package_id") or _enrollment_module._auto_package(
+        db, subject, grade, _track_student.center_id if _track_student else None)
 
     if "exam_session_id" in body:
         exam_session_id = body["exam_session_id"] or None
@@ -6099,10 +6105,16 @@ async def create_holiday(request: Request, db: Session = Depends(get_db)):
 # ==================== PAYMENT — Packages ====================
 
 @app.get("/admin/packages")
-def list_packages(db: Session = Depends(get_db),
+def list_packages(center_id: Optional[int] = None, db: Session = Depends(get_db),
                  current = Depends(require_roles("super_admin", "center_admin"))):
     import json as _json
-    pkgs = db.query(Package).filter(Package.is_archived == False).all()
+    own_center = _caller_center_id(current)
+    q = db.query(Package).filter(Package.is_archived == False)
+    if own_center is not None:
+        q = q.filter(Package.center_id == own_center)
+    elif center_id:
+        q = q.filter(Package.center_id == center_id)
+    pkgs = q.all()
     result = []
     for p in pkgs:
         try:
@@ -6132,6 +6144,7 @@ def list_packages(db: Session = Depends(get_db),
             "is_published": p.is_published,
             "is_archived": p.is_archived,
             "description": p.description or "",
+            "center_id": p.center_id,
         })
     return result
 
@@ -6150,8 +6163,13 @@ async def create_package(request: Request, db: Session = Depends(get_db),
     body = await request.json()
     import json
     _validate_package_fields(body.get("total_sessions", 8), body.get("validity_days", 30))
+    own_center = _caller_center_id(current)
+    target_center_id = own_center if own_center is not None else body.get("center_id")
+    if not target_center_id:
+        raise HTTPException(status_code=400, detail="center_id is required")
     pkg = Package(
         name=body["name"],
+        center_id=target_center_id,
         applicable_grades=json.dumps(body.get("applicable_grades", [])),
         applicable_courses=json.dumps(body.get("applicable_courses", [])),
         validity_days=body.get("validity_days", 30),
@@ -6183,6 +6201,9 @@ async def update_package(pkg_id: int, request: Request, db: Session = Depends(ge
     pkg = db.query(Package).filter(Package.id == pkg_id).first()
     if not pkg:
         raise HTTPException(status_code=404, detail="Package not found")
+    own_center = _caller_center_id(current)
+    if own_center is not None and pkg.center_id != own_center:
+        raise HTTPException(status_code=403, detail="Cannot modify another center's package")
     _validate_package_fields(
         body.get("total_sessions", pkg.total_sessions),
         body.get("validity_days", pkg.validity_days),
@@ -6192,6 +6213,10 @@ async def update_package(pkg_id: int, request: Request, db: Session = Depends(ge
                   "prorate_enabled", "price", "tax_percentage", "is_published", "is_archived", "description"]:
         if field in body:
             setattr(pkg, field, body[field])
+    # Reassigning which center owns a package is a super_admin-only action —
+    # a center_admin must never be able to move a package into/out of scope.
+    if "center_id" in body and own_center is None:
+        pkg.center_id = body["center_id"]
     if "applicable_grades" in body:
         pkg.applicable_grades = json.dumps(body["applicable_grades"])
     if "applicable_courses" in body:
@@ -7031,6 +7056,12 @@ def delete_invoice(inv_id: int, request: Request, db: Session = Depends(get_db),
     if current.get("obj").access_role == "center_admin" and inv.center_id != current["obj"].center_id:
         raise HTTPException(status_code=403, detail="Cannot delete invoices outside your center")
     inv_center_id = inv.center_id
+    # StudentPackage.invoice_id has no cascade — a package activated from this
+    # invoice would otherwise fail the delete with a raw FK IntegrityError
+    # (uncaught → 500 with no detail, which is what made this look silently
+    # broken in the UI). Decouple rather than block the delete.
+    db.query(StudentPackage).filter(StudentPackage.invoice_id == inv_id).update(
+        {"invoice_id": None}, synchronize_session=False)
     db.delete(inv)   # cascades to items / installments / payments
     db.commit()
     # Phase 4A: Audit invoice.deleted

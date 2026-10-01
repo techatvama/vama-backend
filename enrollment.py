@@ -33,12 +33,17 @@ router = APIRouter()
 # Internal helpers
 # ─────────────────────────────────────────────
 
-def _auto_package(db: Session, subject: str, grade: str) -> Optional[int]:
-    """Return the best matching published Package id for (subject, grade), or None."""
-    pkgs = db.query(Package).filter(
+def _auto_package(db: Session, subject: str, grade: str, center_id: Optional[int] = None) -> Optional[int]:
+    """Return the best matching published Package id for (subject, grade), or
+    None. Packages are per-center — without this filter a student could get
+    auto-assigned another center's package."""
+    q = db.query(Package).filter(
         Package.is_published == True,
         Package.is_archived == False,
-    ).all()
+    )
+    if center_id is not None:
+        q = q.filter(Package.center_id == center_id)
+    pkgs = q.all()
     for pkg in pkgs:
         try:
             grades = json.loads(pkg.applicable_grades or "[]")
@@ -181,7 +186,7 @@ async def create_enrollment(
     if not center_id and caller and getattr(caller, "access_role", None) == "center_admin":
         center_id = getattr(caller, "center_id", None)
 
-    fee_package_id = body.get("fee_package_id") or _auto_package(db, subject, grade)
+    fee_package_id = body.get("fee_package_id") or _auto_package(db, subject, grade, center_id)
 
     enrollment = LearningEnrollment(
         student_id=student_id,
@@ -328,7 +333,7 @@ async def update_enrollment(
     if "fee_package_id" in body:
         e.fee_package_id = body["fee_package_id"]
     elif grade_changed:
-        mapped = _auto_package(db, e.subject, e.grade)
+        mapped = _auto_package(db, e.subject, e.grade, e.center_id)
         if mapped:
             e.fee_package_id = mapped
 
@@ -430,7 +435,7 @@ async def teacher_update_grade(
             raise HTTPException(status_code=403, detail="You can only update your own students")
 
     e.grade = grade
-    mapped = _auto_package(db, e.subject, grade)
+    mapped = _auto_package(db, e.subject, grade, e.center_id)
     if mapped:
         e.fee_package_id = mapped
 
