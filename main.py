@@ -267,6 +267,9 @@ def _run_migrations():
         # pre-migration package not yet assigned to a center (see one-off
         # backfill run alongside this migration). ──
         "ALTER TABLE packages ADD COLUMN IF NOT EXISTS center_id INTEGER REFERENCES centers(id)",
+        # ── Public enrollment form intro text + header banner image, per center ──
+        "ALTER TABLE center_form_configs ADD COLUMN IF NOT EXISTS description TEXT",
+        "ALTER TABLE center_form_configs ADD COLUMN IF NOT EXISTS header_image_url VARCHAR",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -1442,18 +1445,111 @@ def _get_form_config_for_center(center_id: Optional[int], db: Session) -> list:
     return DEFAULT_FORM_FIELDS
 
 
+def _resolve_center_id_from_name(center: Optional[str], db: Session) -> Optional[int]:
+    if not center:
+        return None
+    c = db.query(Center).filter(
+        (func.lower(Center.name) == center.lower()) |
+        (Center.name.ilike(center.replace("-", " ")))
+    ).first()
+    return c.id if c else None
+
+
 @app.get("/public/form-config")
 def get_public_form_config(center: Optional[str] = None, center_id: Optional[int] = None, db: Session = Depends(get_db)):
     """Return form field config for a given center (public, no auth)."""
-    cid = center_id
-    if not cid and center:
-        c = db.query(Center).filter(
-            (func.lower(Center.name) == center.lower()) |
-            (Center.name.ilike(center.replace("-", " ")))
-        ).first()
-        if c:
-            cid = c.id
+    cid = center_id or _resolve_center_id_from_name(center, db)
     return _get_form_config_for_center(cid, db)
+
+
+def _get_form_meta_for_center(center_id: Optional[int], db: Session) -> dict:
+    row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id == center_id).first()
+    if not row:
+        row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id.is_(None)).first()
+    return {
+        "description": row.description if row else None,
+        "header_image_url": row.header_image_url if row else None,
+    }
+
+
+@app.get("/public/form-meta")
+def get_public_form_meta(center: Optional[str] = None, center_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Intro text + header banner for a center's public enrollment form (public, no auth)."""
+    cid = center_id or _resolve_center_id_from_name(center, db)
+    return _get_form_meta_for_center(cid, db)
+
+
+@app.get("/admin/form-meta")
+def get_admin_form_meta(center_id: Optional[int] = None, db: Session = Depends(get_db),
+                        current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    caller = current.get("obj")
+    is_super_admin = "super_admin" in current.get("roles", [])
+    cid = center_id
+    if not is_super_admin:
+        cid = getattr(caller, "center_id", None)
+    elif not cid and caller and getattr(caller, "center_id", None):
+        cid = caller.center_id
+    return _get_form_meta_for_center(cid, db)
+
+
+@app.put("/admin/form-meta")
+async def save_admin_form_meta(request: Request, center_id: Optional[int] = None,
+                               db: Session = Depends(get_db),
+                               current=Depends(require_roles("super_admin", "center_admin", "staff"))):
+    body = await request.json()
+    caller = current.get("obj")
+    is_super_admin = "super_admin" in current.get("roles", [])
+    cid = center_id
+    if not is_super_admin:
+        cid = getattr(caller, "center_id", None)
+    elif not cid and caller and getattr(caller, "center_id", None):
+        cid = caller.center_id
+
+    row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id == cid).first()
+    if not row:
+        import json as _json
+        row = CenterFormConfig(center_id=cid, fields_json=_json.dumps(DEFAULT_FORM_FIELDS))
+        db.add(row)
+    if "description" in body:
+        row.description = (body["description"] or "").strip() or None
+    if "header_image_url" in body:
+        row.header_image_url = body["header_image_url"] or None
+    db.commit()
+    return {"saved": True, "center_id": cid, "description": row.description, "header_image_url": row.header_image_url}
+
+
+@app.post("/admin/upload-form-header-image")
+async def upload_form_header_image(file: UploadFile = File(...),
+                                   center_id: Optional[int] = None, db: Session = Depends(get_db),
+                                   current = Depends(require_roles("super_admin", "center_admin"))):
+    """Upload the per-center header banner shown on the public enrollment form."""
+    caller = current.get("obj")
+    is_super_admin = getattr(caller, "access_role", None) == "super_admin"
+    cid = center_id if is_super_admin else getattr(caller, "center_id", None)
+    if not cid:
+        raise HTTPException(status_code=400, detail="center_id is required")
+
+    ext = (file.filename or "header.png").rsplit(".", 1)[-1].lower()
+    if ext not in ("png", "jpg", "jpeg", "webp"):   # svg dropped: could carry an embedded <script>
+        ext = "png"
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large (max 5MB)")
+    path = f"static/form_header_{cid}.{ext}"
+    with open(path, "wb") as f:
+        f.write(contents)
+    import time as _time
+    backend_base = _osmod.getenv("BACKEND_URL", "https://vama-backend-production-115a.up.railway.app")
+    url = f"{backend_base.rstrip('/')}/{path}?v={int(_time.time())}"
+
+    row = db.query(CenterFormConfig).filter(CenterFormConfig.center_id == cid).first()
+    if not row:
+        import json as _json
+        row = CenterFormConfig(center_id=cid, fields_json=_json.dumps(DEFAULT_FORM_FIELDS))
+        db.add(row)
+    row.header_image_url = url
+    db.commit()
+    return {"header_image_url": url}
 
 
 @app.get("/admin/form-config")

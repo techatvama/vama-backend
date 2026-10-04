@@ -247,6 +247,8 @@ class CenterFormConfig(Base):
     id = Column(Integer, primary_key=True, index=True)
     center_id = Column(Integer, ForeignKey("centers.id"), nullable=True, unique=True)
     fields_json = Column(Text, nullable=False)  # JSON array of field config objects
+    description = Column(Text, nullable=True)        # intro text shown above the public form
+    header_image_url = Column(String, nullable=True)  # banner image shown above the public form
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
     center = relationship("Center")
