@@ -1380,20 +1380,29 @@ def _hard_delete_student(db: Session, student: "Student"):
 
 @app.post("/students/bulk-delete")
 async def bulk_delete_students(request: Request, db: Session = Depends(get_db),
-                               current = Depends(require_roles("super_admin"))):
+                               current = Depends(require_roles("super_admin", "center_admin"))):
     """Permanently delete multiple students and all their linked records.
-    Irreversible — super_admin only. Each id is processed in its own
-    transaction so one failure doesn't roll back the rest of the batch."""
+    Irreversible. super_admin can delete anyone; center_admin is restricted
+    to their own center's students (checked per-row below, same pattern as
+    every other center-scoped endpoint) — explicitly approved as a everyday
+    cleanup action for a center managing its own roster, not blocked outright.
+    Each id is processed in its own transaction so one failure doesn't roll
+    back the rest of the batch."""
     body = await request.json()
     ids = body.get("student_ids") or []
     if not isinstance(ids, list) or not ids:
         raise HTTPException(status_code=400, detail="student_ids must be a non-empty list")
+
+    own_center = _caller_center_id(current)
 
     results = []
     for sid in ids:
         student = db.query(Student).filter(Student.id == sid).first()
         if not student:
             results.append({"id": sid, "ok": False, "message": "Not found"})
+            continue
+        if own_center is not None and student.center_id != own_center:
+            results.append({"id": sid, "ok": False, "message": "Cannot delete another center's student"})
             continue
         snapshot = {"student_id": sid, "name": f"{student.first_name} {student.last_name}", "email": student.email}
         try:
