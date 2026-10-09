@@ -2014,6 +2014,16 @@ def _activate_package_for_invoice(db: Session, inv: "Invoice"):
     if not pkg:
         return
 
+    # The invoice's own line item carries whatever "Valid Till" date the
+    # admin actually set when creating the invoice (editable in the Create
+    # Invoice form, defaults to but can differ from the package's own
+    # validity_days) — that's the real agreed validity, so it wins over
+    # recomputing one from the package definition.
+    item = db.query(InvoiceItem).filter(
+        InvoiceItem.invoice_id == inv.id, InvoiceItem.package_id == inv.package_id,
+    ).first()
+    invoice_valid_till = item.valid_till if item and item.valid_till else None
+
     from datetime import date, timedelta
     today_d = date.today()
 
@@ -2026,17 +2036,17 @@ def _activate_package_for_invoice(db: Session, inv: "Invoice"):
         state = resolve_package_state(db, active_sp)
         if state and state["sessions_remaining"] > 0 and not state["is_expired"]:
             queue_start = active_sp.end_date or str(today_d)
-            queue_end = str((date.fromisoformat(queue_start) + timedelta(days=pkg.validity_days or 30)))
+            queue_end = invoice_valid_till or str((date.fromisoformat(queue_start) + timedelta(days=pkg.validity_days or 30)))
             new_status = "queued"
             start, end = queue_start, queue_end
         else:
             active_sp.status = "expired" if state and state["is_expired"] else "exhausted"
             start = str(today_d)
-            end = str(today_d + timedelta(days=pkg.validity_days or 30))
+            end = invoice_valid_till or str(today_d + timedelta(days=pkg.validity_days or 30))
             new_status = "active"
     else:
         start = str(today_d)
-        end = str(today_d + timedelta(days=pkg.validity_days or 30))
+        end = invoice_valid_till or str(today_d + timedelta(days=pkg.validity_days or 30))
         new_status = "active"
 
     for old_q in db.query(StudentPackage).filter(
@@ -2286,11 +2296,15 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db),
             "teacher": teacher.name if teacher else "—",
         })
 
-    # "Classes" stat = classes already held this calendar month (month start → today)
+    # "Classes" stat = classes actually attended (marked present) this
+    # calendar month — not just classes that occurred, regardless of
+    # whether the student showed up.
     month_start = _date.today().replace(day=1)
-    classes_done_this_month = sum(
-        1 for o in past_occs if o.date >= month_start.isoformat()
-    )
+    month_occ_ids = [o.id for o in past_occs if o.date >= month_start.isoformat()]
+    classes_done_this_month = db.query(Attendance).filter(
+        Attendance.session_id.in_(month_occ_ids or [-1]),
+        Attendance.student_id == student_id, Attendance.status == "present",
+    ).count() if month_occ_ids else 0
 
     # ── Payment history ─────────────────────────────────────
     invoices = db.query(Invoice).filter(Invoice.student_id == student_id).order_by(Invoice.issue_date.desc()).all()
