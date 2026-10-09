@@ -2004,6 +2004,10 @@ def _activate_package_for_invoice(db: Session, inv: "Invoice"):
     (invoice_id), so re-saving an already-paid invoice never double-activates."""
     if not inv.package_id:
         return
+    if not (inv.total_amount or 0) > 0:
+        # A ₹0 invoice has nothing actually paid for — never activate a
+        # package off of one, regardless of what flipped its status.
+        return
     if db.query(StudentPackage).filter(StudentPackage.invoice_id == inv.id).first():
         return
     pkg = db.query(Package).filter(Package.id == inv.package_id).first()
@@ -2373,7 +2377,11 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db),
         "preferred_mode_of_contact": student.preferred_mode_of_contact or "",
         "enrollment_date": student.created_at.isoformat() if student.created_at else None,
         "status": "active",
-        "current_grade": student.current_grade or "Debut",
+        # current_grade defaults to "Debut" in the DB for every student row
+        # regardless of whether they've ever actually been assigned a
+        # teacher/subject — only surface it once a real assignment exists,
+        # same rule as the curriculum/progress pages (see _build_progress_response).
+        "current_grade": student.current_grade if (student.teacher_id or active_learning_enrolls) else None,
         "desired_course": student.desired_course or "",
         "instrument": student.instrument or student.desired_course or "",
         "syllabus_type": student.syllabus_type or "Trinity",
@@ -2393,7 +2401,7 @@ def get_student_complete_profile(student_id: int, db: Session = Depends(get_db),
         "active_package": package_info,
         "performance": {
             "attendance_percentage": att_pct,
-            "overall_grade": student.current_grade or "—",
+            "overall_grade": student.current_grade if (student.teacher_id or active_learning_enrolls) else None,
             "total_classes": grand_total_classes,
             "total_attended": grand_total_attended,
             "progress_items_total": len(progress_records),
