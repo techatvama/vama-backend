@@ -379,6 +379,7 @@ class StudentPackage(Base):
     status = Column(String, default="active")  # active | expired | exhausted | cancelled | paused
     paused_at = Column(String, nullable=True)  # date (YYYY-MM-DD) the package was paused for a student break
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)  # the paid invoice this activation came from — guards against double-activation
+    sessions_total_override = Column(Integer, nullable=True)  # from the invoice item's quantity when it differs from the package's own total_sessions
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

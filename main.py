@@ -270,6 +270,10 @@ def _run_migrations():
         # ── Public enrollment form intro text + header banner image, per center ──
         "ALTER TABLE center_form_configs ADD COLUMN IF NOT EXISTS description TEXT",
         "ALTER TABLE center_form_configs ADD COLUMN IF NOT EXISTS header_image_url VARCHAR",
+        # ── A package activated from an invoice may have been sold with a
+        # different session count than the Package catalog entry (admin
+        # edited the invoice's Qty) — store that override per-activation. ──
+        "ALTER TABLE student_packages ADD COLUMN IF NOT EXISTS sessions_total_override INTEGER",
     ]
     # One connection for the whole batch — opening a fresh connection per
     # statement (105+ of them) is what made cold starts slow (each is a round
@@ -1954,7 +1958,10 @@ def resolve_package_state(db: Session, sp: "StudentPackage") -> Optional[dict]:
     if not sp:
         return None
     pkg = db.query(Package).filter(Package.id == sp.package_id).first()
-    total = (pkg.total_sessions if pkg and pkg.total_sessions else 0)
+    # Prefer the session count this specific activation was sold with (the
+    # invoice item's Qty, which an admin can edit away from the package's
+    # own definition) over the live Package catalog value.
+    total = sp.sessions_total_override if sp.sessions_total_override else (pkg.total_sessions if pkg and pkg.total_sessions else 0)
     used = sessions_used_for_package(db, sp)
     remaining = total - used
     makeup_allowed = (pkg.makeup_sessions if pkg else 0) or 0
@@ -2023,6 +2030,12 @@ def _activate_package_for_invoice(db: Session, inv: "Invoice"):
         InvoiceItem.invoice_id == inv.id, InvoiceItem.package_id == inv.package_id,
     ).first()
     invoice_valid_till = item.valid_till if item and item.valid_till else None
+    # Same for session count — only store an override when the admin
+    # actually changed Qty away from the package's own total_sessions,
+    # so a plain unmodified sale still tracks the live catalog value.
+    sessions_override = (
+        item.quantity if item and item.quantity and item.quantity != pkg.total_sessions else None
+    )
 
     from datetime import date, timedelta
     today_d = date.today()
@@ -2059,7 +2072,7 @@ def _activate_package_for_invoice(db: Session, inv: "Invoice"):
         student_id=inv.student_id, package_id=inv.package_id,
         start_date=str(start), end_date=str(end),
         sessions_used=0, makeup_used=0, status=new_status,
-        invoice_id=inv.id,
+        invoice_id=inv.id, sessions_total_override=sessions_override,
     ))
 
 
