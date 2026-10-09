@@ -2011,10 +2011,6 @@ def _activate_package_for_invoice(db: Session, inv: "Invoice"):
     (invoice_id), so re-saving an already-paid invoice never double-activates."""
     if not inv.package_id:
         return
-    if not (inv.total_amount or 0) > 0:
-        # A ₹0 invoice has nothing actually paid for — never activate a
-        # package off of one, regardless of what flipped its status.
-        return
     if db.query(StudentPackage).filter(StudentPackage.invoice_id == inv.id).first():
         return
     pkg = db.query(Package).filter(Package.id == inv.package_id).first()
@@ -7067,6 +7063,15 @@ async def create_invoice(request: Request, db: Session = Depends(get_db),
     for i, ins in enumerate(inst_list, start=1):
         db.add(InvoiceInstallment(invoice_id=inv.id, seq=i, due_date=ins.get("due_date"),
                                   amount=float(ins.get("amount", 0) or 0)))
+    db.flush()
+    # A ₹0 invoice has nothing to collect — it's paid in full by
+    # definition the moment it's created (e.g. a courtesy/free package),
+    # so activate its package immediately rather than waiting on a
+    # "mark paid" step that a ₹0 balance can never actually trigger.
+    if total <= 0:
+        inv.status = "paid"
+        inv.paid_date = str(_dd.today())
+        _activate_package_for_invoice(db, inv)
     db.commit()
     # Phase 4A: Audit invoice.created
     audit(db, "invoice.created", subject=("staff", current["id"]), request=request,
